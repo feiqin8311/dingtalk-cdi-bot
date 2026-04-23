@@ -1,0 +1,6 @@
+openpyxl
+pandas
+numpy
+num2words
+pywin32
+PyQt6
