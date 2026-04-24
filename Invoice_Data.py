@@ -622,10 +622,23 @@ class CustomsDeclaration:
         ws.add_image(img, cell_location)
 
     @staticmethod
-    def set_excel_page_view(file_path: str) -> None:
+    def apply_persistent_page_setup(ws) -> None:
+        """将分页预览和单页缩放设置持久化写入工作表"""
+        ws.sheet_view.view = "pageBreakPreview"
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 1
+
+    @classmethod
+    def set_excel_page_view(cls, file_path: str) -> None:
         """
         设置Excel为分页预览模式，并将数据放在第一页
         """
+        workbook = load_workbook(file_path)
+        for sheet in workbook.worksheets:
+            cls.apply_persistent_page_setup(sheet)
+        workbook.save(file_path)
+        workbook.close()
+
         try:
             # 尝试连接 WPS 表格应用程序
             try:
@@ -640,7 +653,11 @@ class CustomsDeclaration:
                 print("已连接到 Microsoft Excel")
             except:
                 print("也无法连接 Excel")
-                raise
+                return
+
+        if app is None or not hasattr(app, "Workbooks"):
+            print("无法连接可用的 WPS/Excel COM 对象，已保留 openpyxl 写入的分页设置")
+            return
 
         try:
             # 打开工作簿
@@ -659,6 +676,8 @@ class CustomsDeclaration:
                     # 获取页面设置对象
                     page_setup = sheet.PageSetup
 
+                    # 关闭缩放比例模式，否则按页缩放可能不生效
+                    page_setup.Zoom = False
                     # 将所有内容调整为一页宽和一页高
                     page_setup.FitToPagesWide = 1
                     page_setup.FitToPagesTall = 1
@@ -674,7 +693,7 @@ class CustomsDeclaration:
 
         except Exception as e:
             print(f"处理文件时出错: {e}")
-            raise
+            return
 
     def calculate_shipping_costs(self, total_volume: float, total_weight: float) -> None:
         """计算运费"""
@@ -2594,6 +2613,8 @@ class CustomsDeclaration:
             self.add_contract_sheet(output_filepath, pictures_path, wb=wb)
             self.add_customs_declaration_sheet(output_filepath, pictures_path, wb=wb)
             self.add_elements_sheet(elements_filepath, output_filepath, pictures_path, wb=wb)
+            for sheet in wb.worksheets:
+                self.apply_persistent_page_setup(sheet)
             wb.save(output_filepath)
 
             # 复制并准备填充申报模板（可选）
