@@ -3,7 +3,7 @@
 **日期**: 2026-04-24
 
 **目标**
-- 减少 [Invoice_Data.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/Invoice_Data.py) 与 [Stock_Preparation.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/Stock_Preparation.py) 的重复逻辑
+- 减少 [invoice_data.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/invoice_data.py) 与 [stock_preparation.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/stock_preparation.py) 的重复逻辑
 - 降低新增业务规则、单据类型、登记字段时的改动成本
 - 在不破坏现有 UI 和业务结果的前提下，渐进式重构系统结构
 

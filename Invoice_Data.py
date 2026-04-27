@@ -1,5 +1,5 @@
 """
-File: Invoice_Data.py
+File: invoice_data.py
 Created Time: 2025-09-03
 Author: KePengxiang
 Comment: 对发货单进行数据处理
@@ -22,6 +22,23 @@ from openpyxl.drawing.image import Image
 import win32com.client as win32
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl import load_workbook
+from app.core.excel_io import ExcelCache
+from app.core.models import select_register_filepath as core_select_register_filepath
+from app.core.logging import get_log_dir, log_message as core_log_message
+from app.core.metrics import append_call_record as core_append_call_record
+from app.core.page_setup import apply_persistent_page_setup as core_apply_persistent_page_setup
+from app.core.page_setup import set_excel_page_view as core_set_excel_page_view
+from app.services.declared_price_service import select_declared_price_columns
+from app.services.elements_service import find_data_group as shared_find_data_group
+from app.services.freight_service import calculate_shipping_costs as shared_calculate_shipping_costs
+from app.renderers.common import ensure_default_sheet_removed, finalize_workbook_page_setup
+from app.renderers.detailed_list import render_detailed_list
+from app.renderers.packing_list import render_packing_list
+from app.renderers.bill import render_bill
+from app.renderers.contract import render_contract
+from app.renderers.customs_declaration import render_customs_declaration
+from app.renderers.elements_sheet import render_elements_sheet
+from app.flows.invoice_flow import InvoiceFlow
 
 _PC_PATTERN = re.compile(r'(\d+)(?:[Pp][Cc]|件|片)')
 _ELEMENTS_GROUP_CACHE = {}
@@ -41,8 +58,7 @@ _ALIGNMENT_CLS = Alignment
 
 # 日志文件路径（打包时落在可执行文件所在目录）
 def _get_log_dir() -> str:
-    base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_dir, "Logs")
+    return get_log_dir(__file__)
 
 
 _LOG_DIR = _get_log_dir()
@@ -96,59 +112,24 @@ if not os.path.exists(_LOG_DIR):
 
 def log_message(message: str) -> None:
     """同时输出日志到控制台和文件"""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_line = f"[{timestamp}] {message}"
-    print(log_line)
-    try:
-        with open(_LOG_FILE_PATH, 'a', encoding='utf-8') as f:
-            f.write(log_line + '\n')
-    except Exception as e:
-        print(f"写入日志文件失败: {e}, 路径: {_LOG_FILE_PATH}")
+    core_log_message(_LOG_FILE_PATH, message)
 
 
 def append_call_record(module_name: str, action: str, success: bool, duration_seconds: float,
                        invoice_number: str = "", source_file: str = "", error_message: str = "") -> None:
     """将调用记录追加到Excel统计表"""
-    try:
-        metrics_dir = os.path.dirname(_METRICS_FILE_PATH)
-        if metrics_dir and not os.path.exists(metrics_dir):
-            os.makedirs(metrics_dir, exist_ok=True)
-
-        if os.path.exists(_METRICS_FILE_PATH):
-            wb = load_workbook(_METRICS_FILE_PATH)
-            if _METRICS_SHEET_NAME in wb.sheetnames:
-                ws = wb[_METRICS_SHEET_NAME]
-            else:
-                ws = wb.create_sheet(_METRICS_SHEET_NAME)
-        else:
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = _METRICS_SHEET_NAME
-
-        # 空表时补齐表头
-        if ws.max_row == 1 and ws.cell(row=1, column=1).value is None:
-            for idx, header in enumerate(_METRICS_HEADERS, start=1):
-                ws.cell(row=1, column=idx, value=header)
-        elif ws.max_row == 1:
-            current_headers = [ws.cell(row=1, column=i).value for i in range(1, len(_METRICS_HEADERS) + 1)]
-            if current_headers != _METRICS_HEADERS:
-                ws.insert_rows(1)
-                for idx, header in enumerate(_METRICS_HEADERS, start=1):
-                    ws.cell(row=1, column=idx, value=header)
-
-        ws.append([
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            module_name,
-            action,
-            "成功" if success else "失败",
-            round(duration_seconds, 3),
-            invoice_number or "",
-            source_file or "",
-            error_message or "",
-        ])
-        wb.save(_METRICS_FILE_PATH)
-    except Exception as e:
-        print(f"写入调用统计失败: {e}, 路径: {_METRICS_FILE_PATH}")
+    core_append_call_record(
+        _METRICS_FILE_PATH,
+        _METRICS_SHEET_NAME,
+        _METRICS_HEADERS,
+        module_name,
+        action,
+        success,
+        duration_seconds,
+        invoice_number=invoice_number,
+        source_file=source_file,
+        error_message=error_message,
+    )
 
 
 
@@ -177,10 +158,13 @@ class CustomsDeclaration:
         """存储数据"""
         self.shipping_details = {}
         self.result_df = None
-        self._excel_cache = {}
+        self._excel_cache = ExcelCache()
         self._product_name_cache = {}
         self._declared_price_cache = {}
         self._register_combined_cache = {}
+        self.log_message = log_message
+        self.append_call_record = append_call_record
+        self.flow = InvoiceFlow(self)
         # Excel工作表名称
         self.sheet_name = ['明细单', '装箱单', '发票', '合同', '报关单', '要素']
         # 月份编码
@@ -397,25 +381,14 @@ class CustomsDeclaration:
 
     @staticmethod
     def _freeze_cache_value(value):
-        if isinstance(value, list):
-            return tuple(value)
-        if isinstance(value, dict):
-            return tuple(sorted((k, CustomsDeclaration._freeze_cache_value(v)) for k, v in value.items()))
-        if isinstance(value, set):
-            return tuple(sorted(value))
-        return value
+        return ExcelCache._freeze(value)
 
     def _read_excel_cached(self, file_path: str, sheet_name: str, **kwargs) -> pd.DataFrame:
-        key = (
-            file_path,
-            sheet_name,
-            tuple(sorted((k, self._freeze_cache_value(v)) for k, v in kwargs.items())),
-        )
-        cached = self._excel_cache.get(key)
-        if cached is None:
-            cached = pd.read_excel(file_path, sheet_name=sheet_name, **kwargs)
-            self._excel_cache[key] = cached
-        return cached.copy()
+        return self._excel_cache.read(file_path, sheet_name, **kwargs)
+
+    def _log_timed_step(self, label: str, start_time: datetime.datetime) -> None:
+        duration = (datetime.datetime.now() - start_time).total_seconds()
+        self.log_message(f"{label}耗时: {duration:.3f}s")
 
     def _get_product_name_df(self, product_name_filepath: str) -> pd.DataFrame:
         cached = self._product_name_cache.get(product_name_filepath)
@@ -455,93 +428,12 @@ class CustomsDeclaration:
     @staticmethod
     def find_data_group(elements_file_path: str, result_df: pd.DataFrame) -> List[List[str]]:
         """查找要素表的数据组"""
-
-        # 存储最终的数据组
-        result_groups = []
-        # 预编译匹配"品名"+任意标点符号+后面的所有内容
-        name_pattern = re.compile(r'品名[；;：:+\-=\s]*([^。.;；]+)')
-        # 使用itertuples避免多余的中间列表
-        for data in result_df.itertuples(index=False, name=None):
-            # 如果是SIXPRAY品牌，就使用TOLESA Sheet页
-            if data[-1] in ['SIXPRAY']:
-                sheet_name = 'TOLESA'
-            else:
-                sheet_name = data[-1]
-
-            cache_key = (elements_file_path, sheet_name)
-            if cache_key not in _ELEMENTS_GROUP_CACHE:
-                # 读取时没有列名
-                elements_df = pd.read_excel(elements_file_path, sheet_name=sheet_name, header=None)
-                # 数据转列表
-                elements_data_list = elements_df.iloc[:, 0].tolist()
-                # 将NaN转换为空字符串
-                elements_data_list = [str(x) if pd.notna(x) else '' for x in elements_data_list]
-                # 根据空白行分组
-                groups = []
-                current_group = []
-                for value in elements_data_list:
-                    if value.strip() == '':
-                        if current_group:
-                            groups.append(current_group)
-                            current_group = []
-                    else:
-                        current_group.append(value)
-
-                if current_group:
-                    groups.append(current_group)
-
-                # 预计算每组文本与金刚石标记
-                prepared_groups = []
-                for group in groups:
-                    group_text = ' '.join(group)
-                    prepared_groups.append((group, group_text, "金刚石" in group_text))
-                _ELEMENTS_GROUP_CACHE[cache_key] = prepared_groups
-
-            prepared_groups = _ELEMENTS_GROUP_CACHE[cache_key]
-
-            # 遍历groups,查找是否有包含指定HS编码的组
-            # 从result_data中获取HS编码
-            target_hs_code = data[3]
-            # 如果target_hs_code为空，就报错
-            if pd.isna(target_hs_code):
-                raise ValueError(
-                    f"报关中文品名：{data[1]}，HS CODE为空，请去品名表.xlsx，请添加此报关中文品名！")
-
-            found_group = None
-            # 判断是否找到
-            elements_falg = False
-            for group, group_text, contains_diamond in prepared_groups:
-                # 如果包含HS编码并都包含"金刚石"或者都不包含"金刚石"
-                if target_hs_code in group_text and contains_diamond == data[-2]:
-                    for temp_date in group:
-                        match = name_pattern.search(temp_date)
-                        if not match:
-                            continue
-                        if match.group(1).strip() == data[1].strip():
-                            found_group = list(group)
-                            elements_falg = True
-                            break
-                    if elements_falg:
-                        break
-
-            # 如果found_group为空，就报错
-            if found_group is None:
-                print(data)
-                raise ValueError(
-                    f"HS CODE：{data[3]}，报关中文品名：{data[1]}，请去要素表.xlsx的{data[-1]}页添加此要素！")
-
-            # 添加SKU
-            found_group.append(data[0])
-
-            # 添加套数
-            if data[5] == '套':
-                sets = f"{data[4]}{data[5]}={data[-3]}个"
-                found_group.append(sets)
-
-            if found_group:
-                result_groups.append(found_group)
-
-        return result_groups
+        return shared_find_data_group(
+            elements_file_path,
+            result_df,
+            cache=_ELEMENTS_GROUP_CACHE,
+            sheet_name_transform=lambda name: "TOLESA" if name in ["SIXPRAY"] else name,
+        )
 
     @staticmethod
     def number_to_words(amount: float) -> str:
@@ -624,130 +516,26 @@ class CustomsDeclaration:
     @staticmethod
     def apply_persistent_page_setup(ws) -> None:
         """将分页预览和单页缩放设置持久化写入工作表"""
-        ws.sheet_view.view = "pageBreakPreview"
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 1
+        core_apply_persistent_page_setup(ws)
 
     @classmethod
     def set_excel_page_view(cls, file_path: str) -> None:
         """
         设置Excel为分页预览模式，并将数据放在第一页
         """
-        workbook = load_workbook(file_path)
-        for sheet in workbook.worksheets:
-            cls.apply_persistent_page_setup(sheet)
-        workbook.save(file_path)
-        workbook.close()
-
-        try:
-            # 尝试连接 WPS 表格应用程序
-            try:
-                app = win32.Dispatch("Ket.Application")
-            except:
-                app = win32.Dispatch("WPS.Application")
-        except Exception as e:
-            print(f"无法连接 WPS: {e}")
-            # 尝试连接 Excel 作为备选
-            try:
-                app = win32.Dispatch("Excel.Application")
-                print("已连接到 Microsoft Excel")
-            except:
-                print("也无法连接 Excel")
-                return
-
-        if app is None or not hasattr(app, "Workbooks"):
-            print("无法连接可用的 WPS/Excel COM 对象，已保留 openpyxl 写入的分页设置")
-            return
-
-        try:
-            # 打开工作簿
-            workbook = app.Workbooks.Open(file_path)
-
-            # 定义分页预览模式
-            preview_mode = 2
-
-            # 遍历所有工作表并设置为分页预览模式，同时调整页面设置
-            for sheet in workbook.Worksheets:
-                sheet.Activate()
-                try:
-                    # 设置分页预览模式
-                    app.ActiveWindow.View = preview_mode
-
-                    # 获取页面设置对象
-                    page_setup = sheet.PageSetup
-
-                    # 关闭缩放比例模式，否则按页缩放可能不生效
-                    page_setup.Zoom = False
-                    # 将所有内容调整为一页宽和一页高
-                    page_setup.FitToPagesWide = 1
-                    page_setup.FitToPagesTall = 1
-
-                    print(f"已调整工作表 {sheet.Name} 的页面设置")
-
-                except Exception as e:
-                    print(f"无法设置工作表 {sheet.Name} 的页面设置: {e}")
-
-            # 保存并关闭
-            workbook.Save()
-            workbook.Close()
-
-        except Exception as e:
-            print(f"处理文件时出错: {e}")
-            return
+        core_set_excel_page_view(file_path)
 
     def calculate_shipping_costs(self, total_volume: float, total_weight: float) -> None:
         """计算运费"""
-
-        # 运费,总体积（m³）-箱子的总和<1时取1，总重量（kg）-箱子的总和少于12取12
-        exchange_rate = 7.2
-        # 默认美国
-        multiplier_num1 = 1250
-        # 默认小于1
-        multiplier_num2 = 1
-        freight_basis = "volume"
-        if '海卡' in self.shipping_details['transportation_method']:
-            sea_card_rates = {
-                '加拿大': 800,
-                '日本': 800,
-                '德国': 732 if self.shipping_details[
-                                   'logistics_provider'] == '北京世纪卓越快递服务有限公司（龙舟）' else 1200,
-                '英国': 634 if self.shipping_details[
-                                   'logistics_provider'] == '北京世纪卓越快递服务有限公司（龙舟）' else 1200,
-            }
-            multiplier_num1 = sea_card_rates.get(self.shipping_details['country_zh'], 1250)
-            multiplier_num2 = max(1.0, total_volume)
-            freight_basis = "volume"
-
-        elif '海派' in self.shipping_details['transportation_method']:
-            sea_delivery_rates = {
-                '美国': 12,
-                '加拿大': 12,
-                '澳洲': 10,
-                '日本': 10,
-                '英国': 11
-            }
-            multiplier_num1 = sea_delivery_rates.get(self.shipping_details['country_zh'], 12)
-            multiplier_num2 = max(12.0, total_weight)
-            freight_basis = "weight"
-        elif '空派' in self.shipping_details['transportation_method']:
-            air_delivery_rates = {
-                '美国': 45,
-                '德国': 42,
-            }
-            multiplier_num1 = air_delivery_rates.get(self.shipping_details['country_zh'], 45)
-            multiplier_num2 = max(12.0, total_weight)
-            freight_basis = "weight"
-        elif '卡航' in self.shipping_details['transportation_method']:
-            truck_delivery_rates = {
-                '英国': 15.5,
-                '德国': 16,
-            }
-            multiplier_num1 = truck_delivery_rates.get(self.shipping_details['country_zh'], 15.5)
-            multiplier_num2 = total_weight
-            freight_basis = "weight"
-
-        # 总运费
-        self.shipping_details['freight'] = round(multiplier_num1 * multiplier_num2 / exchange_rate, 2)
+        freight, freight_basis = shared_calculate_shipping_costs(
+            self.shipping_details['transportation_method'],
+            self.shipping_details['logistics_provider'],
+            self.shipping_details['country_zh'],
+            self.shipping_details.get('currency', 'USD'),
+            total_volume,
+            total_weight,
+        )
+        self.shipping_details['freight'] = freight
         self.shipping_details['freight_basis'] = freight_basis
 
     def get_basic_information(self, invoice_filepath: str, site_address_filepath: str,
@@ -934,17 +722,12 @@ class CustomsDeclaration:
         declared_unit_price_df = self._read_excel_cached(
             product_filepath, sheet_name=self.shipping_details['customs_declaration_price']
         )
-        # 易达报关单价Sheet页取"易达-亚马逊申报单价(USD)"列
-        if self.shipping_details['customs_declaration_price'] == "易达报关单价":
-            declared_unit_price_df = declared_unit_price_df[['*SKU', '易达-亚马逊\n申报单价(USD)']]
-            # 重命名为申报单价
-            declared_unit_price_df.rename(columns={'易达-亚马逊\n申报单价(USD)': '申报单价'}, inplace=True)
-        elif self.shipping_details['customs_declaration_price'] == "匠晟报关单价":
-            declared_unit_price_df = declared_unit_price_df[['*SKU', '匠晟-亚马逊\n申报单价(USD)']]
-            # 重命名为申报单价
-            declared_unit_price_df.rename(columns={'匠晟-亚马逊\n申报单价(USD)': '申报单价'}, inplace=True)
-        else:
-            declared_unit_price_df = declared_unit_price_df[['*SKU', '申报单价']]
+        declared_unit_price_df = select_declared_price_columns(
+            declared_unit_price_df,
+            sheet_key=self.shipping_details['customs_declaration_price'],
+            company_info_index=self.company_info_index,
+            is_awd=self.shipping_details.get('is_awd', False),
+        )
 
         # 去除重复数据
         declared_unit_price_df = declared_unit_price_df.drop_duplicates()
@@ -2578,77 +2361,17 @@ class CustomsDeclaration:
                                elements_filepath: str, output_filepath: str, pictures_path: str,
                                flag: bool, generate_declaration_file: bool = True) -> None:
         """生成所有文档"""
-
-        # 更新，是否拼箱
-        self.lcl_flag = flag
-        start_time = datetime.datetime.now()
-        source_file = os.path.basename(invoice_filepath)
-
-        try:
-            log_message(
-                f"开始生成报关资料(发货单) | 发货单: {os.path.basename(invoice_filepath)}, "
-                f"输出目录: {output_filepath}, 拼箱: {self.lcl_flag}"
-            )
-
-            # 处理发货单
-            if flag:
-                print("拼箱")
-                self.lcl_situation(invoice_filepath, product_filepath, product_name_filepath, site_address_filepath)
-            else:
-                print("不拼箱")
-                self.process_invoice(invoice_filepath, product_filepath, product_name_filepath, site_address_filepath)
-
-            # 更新输出路径
-            output_dir = output_filepath
-            output_filepath = os.path.join(output_dir, f"{self.shipping_details['invoice_number']} 报关资料.xlsx")
-            log_message(f"报关资料输出文件: {output_filepath}")
-
-            # 添加各sheet页（统一保存，减少反复读写）
-            wb = openpyxl.Workbook()
-            self.add_detailed_list_sheet(output_filepath, pictures_path, wb=wb)
-            if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
-                del wb["Sheet"]
-            self.add_packing_list_sheet(output_filepath, pictures_path, wb=wb)
-            self.add_bill_sheet(output_filepath, pictures_path, wb=wb)
-            self.add_contract_sheet(output_filepath, pictures_path, wb=wb)
-            self.add_customs_declaration_sheet(output_filepath, pictures_path, wb=wb)
-            self.add_elements_sheet(elements_filepath, output_filepath, pictures_path, wb=wb)
-            for sheet in wb.worksheets:
-                self.apply_persistent_page_setup(sheet)
-            wb.save(output_filepath)
-
-            # 复制并准备填充申报模板（可选）
-            if generate_declaration_file:
-                declaration_template_path = self.copy_declaration_template_file(output_dir)
-                self.fill_declaration_template_file(declaration_template_path)
-            else:
-                log_message("申报文件开关为否，跳过申报模板复制与填充")
-
-            # 设置分页预览
-            self.set_excel_page_view(output_filepath)
-            log_message("报关资料生成完成(发货单)")
-            append_call_record(
-                module_name="发货单",
-                action="生成报关资料",
-                success=True,
-                duration_seconds=(datetime.datetime.now() - start_time).total_seconds(),
-                invoice_number=self.shipping_details.get('invoice_number', ''),
-                source_file=source_file,
-            )
-
-        except Exception as e:
-            print(f"生成文档时出错: {e}")
-            log_message(f"报关资料生成失败(发货单): {e}")
-            append_call_record(
-                module_name="发货单",
-                action="生成报关资料",
-                success=False,
-                duration_seconds=(datetime.datetime.now() - start_time).total_seconds(),
-                invoice_number=self.shipping_details.get('invoice_number', ''),
-                source_file=source_file,
-                error_message=str(e),
-            )
-            raise
+        return self.flow.generate_all_documents(
+            invoice_filepath,
+            product_filepath,
+            product_name_filepath,
+            site_address_filepath,
+            elements_filepath,
+            output_filepath,
+            pictures_path,
+            flag,
+            generate_declaration_file,
+        )
 
     def check_invoice_number(self, register_filepath: str, invoice_number: str, sheet_name: str,
                              column_name: str) -> int:
@@ -2782,7 +2505,8 @@ class CustomsDeclaration:
         except Exception as e:
             raise Exception(f"{label}无法写入：{file_path}，原因：{e}")
 
-    def register_shipping_invoice_number(self, invoice_filepath: str, invoice_number_register_filepath: str) -> int:
+    def register_shipping_invoice_number(self, invoice_filepath: str,
+                                         invoice_number_register_filepath: str) -> tuple[int, int]:
         """登记出货发票号登记表"""
 
         sheet_name = '出运明细'
@@ -2875,7 +2599,7 @@ class CustomsDeclaration:
             self.verify_register_written(
                 invoice_number_register_filepath, sheet_name, column_name, self.shipping_details['invoice_number']
             )
-            return deleted_rows
+            return deleted_rows, actual_total
 
         except Exception as e:
             # 如果是PermissionError，说明有人占用文件
@@ -2953,19 +2677,17 @@ class CustomsDeclaration:
 
         # 店铺
         brand = merged_df['店铺'].unique().tolist()[0]
+        register_filepath = core_select_register_filepath(
+            self.company_info_index,
+            lumiya_register_filepath,
+            easycan_register_filepath,
+            sutong_register_filepath,
+            liulang_register_filepath,
+            jiangsheng_register_filepath,
+        )
         sheet_name = '2026（内部开票）'
 
-        # 根据店铺判断公司
-        if brand in ['EZARC']:
-            register_filepath = easycan_register_filepath
-        elif brand in ['LIBRATON', 'PACMANN']:
-            register_filepath = lumiya_register_filepath
-        elif brand in ['SIXPRAY']:
-            register_filepath = liulang_register_filepath
-        elif brand in ['TOLESA']:
-            register_filepath = jiangsheng_register_filepath
-        else:
-            register_filepath = sutong_register_filepath
+        if self.company_info_index == 2:
             sheet_name = '2026'
 
             # 添加供应商名称
@@ -2981,7 +2703,8 @@ class CustomsDeclaration:
         return register_df, register_filepath, sheet_name, brand, original_rows
 
     def write_invoicing_register(self, register_df: pd.DataFrame, register_filepath: str,
-                                 sheet_name: str, brand: str, original_rows: int, deleted_rows: int) -> None:
+                                 sheet_name: str, brand: str, original_rows: int,
+                                 deleted_rows: int) -> int:
         """写入报关开票登记数据"""
         edited_rows = len(register_df)
 
@@ -3065,6 +2788,7 @@ class CustomsDeclaration:
             self.verify_register_written(
                 register_filepath, sheet_name, column_name, self.shipping_details['invoice_number']
             )
+            return actual_total
 
         except Exception as e:
             # 如果是PermissionError，说明有人占用文件
@@ -3083,7 +2807,7 @@ class CustomsDeclaration:
             invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
             sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
         )
-        self.write_invoicing_register(register_df, register_filepath, sheet_name, brand, original_rows)
+        self.write_invoicing_register(register_df, register_filepath, sheet_name, brand, original_rows, 0)
 
     def register_all_documents(self, invoice_filepath: str, invoice_number_register_filepath: str,
                                product_filepath: str, lumiya_register_filepath: str, easycan_register_filepath: str,
@@ -3104,12 +2828,14 @@ class CustomsDeclaration:
             sheet_name = '出运明细'
             shipping_original_rows = self.find_last_data_row(invoice_number_register_filepath, sheet_name)
             insert_rows = len(self.register_combined_invoice(invoice_filepath))
-            deleted_rows = self.register_shipping_invoice_number(
+            deleted_rows, actual_rows = self.register_shipping_invoice_number(
                 invoice_filepath, invoice_number_register_filepath
             )
             expected_rows = shipping_original_rows - deleted_rows + insert_rows
-
-            self.verify_register_row_count(invoice_number_register_filepath, sheet_name, expected_rows)
+            if actual_rows != expected_rows:
+                raise Exception(
+                    f"登记校验失败：出运明细行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
+                )
 
             # 报关开票登记
             register_original_rows = self.find_last_data_row(register_filepath, invoicing_sheet)
@@ -3117,8 +2843,13 @@ class CustomsDeclaration:
                 register_filepath, self.shipping_details['invoice_number'], invoicing_sheet, '合同号'
             )
             expected_rows = register_original_rows - deleted_rows + len(register_df)
-            self.write_invoicing_register(register_df, register_filepath, invoicing_sheet, brand, invoice_rows, deleted_rows)
-            self.verify_register_row_count(register_filepath, invoicing_sheet, expected_rows)
+            actual_rows = self.write_invoicing_register(
+                register_df, register_filepath, invoicing_sheet, brand, invoice_rows, deleted_rows
+            )
+            if actual_rows != expected_rows:
+                raise Exception(
+                    f"登记校验失败：出运明细行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
+                )
             append_call_record(
                 module_name="发货单",
                 action="登记数据",

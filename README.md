@@ -13,7 +13,7 @@
 
 ## 1. 入口流程
 
-界面入口在 [Ui_PyQt.py](/mnt/d/Projects/Automation/Logistics-Department/Dingtalk-Cdi-Bot/Ui_PyQt.py)。
+界面入口在 [ui_pyqt.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/ui_pyqt.py)。
 
 点击“生成报关资料”后，核心流程在 `process_data()`：
 
@@ -24,10 +24,10 @@
 
 线程里会分两条主线：
 
-- 发货单：调用 [Invoice_Data.py](/mnt/d/Projects/Automation/Logistics-Department/Dingtalk-Cdi-Bot/Invoice_Data.py)
-- 备货单：调用 [Stock_Preparation.py](/mnt/d/Projects/Automation/Logistics-Department/Dingtalk-Cdi-Bot/Stock_Preparation.py)
+- 发货单：调用 [invoice_data.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/invoice_data.py)
+- 备货单：调用 [stock_preparation.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/stock_preparation.py)
 
-本文重点只讲发货单，即 [Invoice_Data.py](/mnt/d/Projects/Automation/Logistics-Department/Dingtalk-Cdi-Bot/Invoice_Data.py)。
+本文重点只讲发货单，即 [invoice_data.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/invoice_data.py)。
 
 
 ## 2. 发货单主流程
@@ -596,7 +596,7 @@
 
 ## 20. `26EA056 发货单.xlsx` 手工演示
 
-这一段专门对应你现在在 [Invoice_Data.py](/mnt/d/Projects/Automation/Logistics-Department/Dingtalk-Cdi-Bot/Invoice_Data.py#L3074) 里写的测试入口。
+这一段专门对应你现在在 [invoice_data.py](/mnt/d/Projects/dingtalk-bot/dingtalk-cdi-bot/invoice_data.py) 里写的测试入口。
 
 当前测试入口是：
 
@@ -971,3 +971,4 @@
 
 如果最后某个品名箱数和你直觉不一致，通常就要去看回补这一步。
 
+# python -m PyInstaller --noconfirm customs_declaration_info.spec

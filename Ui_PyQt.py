@@ -8,8 +8,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QFont, QIcon
-import Invoice_Data
-import Stock_Preparation
+import invoice_data
+import stock_preparation
 
 
 class ToggleButton(QPushButton):
@@ -141,8 +141,8 @@ class ProcessingThread(QThread):
 
             # 初始化CustomsDeclaration()类
             if self.use_stock:
-                generator = Stock_Preparation.CustomsDeclaration()
-                generator.generate_all_documents(
+                generator = stock_preparation.CustomsDeclaration()
+                generator.flow.generate_all_documents(
                     self.input_paths[1],  # 备货单
                     self.input_paths[2],  # 产品信息单证专用
                     self.input_paths[3],  # 品名
@@ -152,7 +152,7 @@ class ProcessingThread(QThread):
                     self.pictures_path, self.is_consolidation, self.is_declaration
                 )
                 if self.is_register:
-                    generator.register_all_documents(
+                    generator.flow.register_all_documents(
                         self.input_paths[1],   # 备货单
                         self.input_paths[6],   # 出运明细
                         self.input_paths[2],   # 产品信息单证专用
@@ -166,8 +166,8 @@ class ProcessingThread(QThread):
                         self.is_consolidation
                     )
             else:
-                generator = Invoice_Data.CustomsDeclaration()
-                generator.generate_all_documents(
+                generator = invoice_data.CustomsDeclaration()
+                generator.flow.generate_all_documents(
                     self.input_paths[0],  # 发货单
                     self.input_paths[2],  # 产品信息单证专用
                     self.input_paths[3],  # 品名
@@ -179,7 +179,7 @@ class ProcessingThread(QThread):
 
                 # 登记所有文档（可选）
                 if self.is_register:
-                    generator.register_all_documents(
+                    generator.flow.register_all_documents(
                         self.input_paths[0],   # 发货单
                         self.input_paths[6],   # 出运明细
                         self.input_paths[2],   # 产品信息单证专用
