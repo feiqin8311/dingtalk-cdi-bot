@@ -752,6 +752,7 @@ class CustomsDeclaration:
             sheet_key=self.shipping_details['customs_declaration_price'],
             company_info_index=self.company_info_index,
             is_awd=self.shipping_details.get('is_awd', False),
+            document_type="stock",
         )
 
         # 去除重复数据
@@ -2650,9 +2651,9 @@ class CustomsDeclaration:
         invoice_details_df = invoice_details_df[
             ['SKU', '店铺', '物流中心编码', '备货单号', '发货仓库（单据）', '物流商', '收货仓库']]
         invoice_details_df = invoice_details_df.ffill()
-        # 如果发货仓库（单据）等于杭州虚拟仓，就为"工厂直发"，否则就为空
+        # 如果发货仓库（单据）等于杭州虚拟仓，就为"工厂直发"，否则为"仓库发货"
         invoice_details_df['发货仓库（单据）'] = invoice_details_df['发货仓库（单据）'].apply(
-            lambda x: "工厂直发" if x == "杭州虚拟仓" else ""
+            lambda x: "工厂直发" if x == "杭州虚拟仓" else "仓库发货"
         )
 
         # 为重复SKU+备货单号增加序号，避免合并后行数膨胀

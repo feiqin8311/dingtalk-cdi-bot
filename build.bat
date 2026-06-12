@@ -40,7 +40,7 @@ if errorlevel 1 (
 )
 
 echo [2/3] Running PyInstaller...
-pyinstaller --noconfirm customs_declaration_info.spec
+pyinstaller --clean --noconfirm customs_declaration_info.spec
 if errorlevel 1 (
     echo PyInstaller build failed.
     pause

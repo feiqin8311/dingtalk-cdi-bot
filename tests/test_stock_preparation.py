@@ -208,6 +208,75 @@ class StockFlowBehaviorTests(unittest.TestCase):
 
 
 class StockRegisterTargetSelectionTests(unittest.TestCase):
+    def test_register_combined_invoice_marks_non_virtual_warehouse_as_warehouse_shipping(self):
+        generator = CustomsDeclaration()
+
+        stock_df = pd.DataFrame(
+            [
+                {
+                    "备货单号": "STOCK-001",
+                    "SKU": "SKU-1",
+                    "备货数量": 1,
+                    "箱数": 1,
+                    "总重量（kg）-箱子": 10,
+                    "总体积（m³）-箱子": 0.1,
+                    "国家": "美国",
+                    "单箱数量": 1,
+                    "箱子毛重（kg）": 10,
+                    "箱子长度（cm）": 10,
+                    "箱子宽度（cm）": 10,
+                    "箱子高度（cm）": 10,
+                    "第三方仓产品名": "Product 1",
+                },
+                {
+                    "备货单号": "STOCK-002",
+                    "SKU": "SKU-2",
+                    "备货数量": 2,
+                    "箱数": 1,
+                    "总重量（kg）-箱子": 20,
+                    "总体积（m³）-箱子": 0.2,
+                    "国家": "美国",
+                    "单箱数量": 2,
+                    "箱子毛重（kg）": 20,
+                    "箱子长度（cm）": 20,
+                    "箱子宽度（cm）": 20,
+                    "箱子高度（cm）": 20,
+                    "第三方仓产品名": "Product 2",
+                },
+            ]
+        )
+        stock_details_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "SKU-1",
+                    "备货单号": "STOCK-001",
+                    "收货仓库": "EZARC NA-US美国仓(AWD)",
+                    "物流中心编码": "IUSP",
+                    "发货仓库（单据）": "杭州虚拟仓",
+                    "物流商": "物流商A",
+                },
+                {
+                    "SKU": "SKU-2",
+                    "备货单号": "STOCK-002",
+                    "收货仓库": "FBT仓-TIKTOK",
+                    "物流中心编码": "FBT",
+                    "发货仓库（单据）": "义乌仓",
+                    "物流商": "物流商A",
+                },
+            ]
+        )
+        brand_df = pd.DataFrame(
+            [
+                {"*SKU": "SKU-1", "品牌": "EZARC"},
+                {"*SKU": "SKU-2", "品牌": "EZARC"},
+            ]
+        )
+
+        with patch.object(generator, "_read_excel_cached", side_effect=[stock_df, stock_details_df, brand_df]):
+            result = generator.register_combined_invoice("stock.xlsx", "product.xlsx")
+
+        self.assertEqual(result["发货仓库（单据）"].tolist(), ["工厂直发", "仓库发货"])
+
     def test_build_invoicing_register_uses_company_title_instead_of_first_brand(self):
         generator = CustomsDeclaration()
         generator.company_info_index = 0

@@ -727,6 +727,7 @@ class CustomsDeclaration:
             sheet_key=self.shipping_details['customs_declaration_price'],
             company_info_index=self.company_info_index,
             is_awd=self.shipping_details.get('is_awd', False),
+            document_type="invoice",
         )
 
         # 去除重复数据
@@ -2427,13 +2428,28 @@ class CustomsDeclaration:
         invoice_details_df = invoice_details_df[
             ['SKU', '运输方式', '物流商单号', '店铺', '物流中心编码', '发货单号', '发货仓库（单据）', '物流商']]
         invoice_details_df = invoice_details_df.ffill()
-        # 如果发货仓库（单据）等于杭州虚拟仓，就为"工厂直发"，否则就为空
+        # 如果发货仓库（单据）等于杭州虚拟仓，就为"工厂直发"，否则为"仓库发货"
         invoice_details_df['发货仓库（单据）'] = invoice_details_df['发货仓库（单据）'].apply(
-            lambda x: "工厂直发" if x == "杭州虚拟仓" else ""
+            lambda x: "工厂直发" if x == "杭州虚拟仓" else "仓库发货"
         )
 
         # 合并数据
         result_df = invoice_df.merge(invoice_details_df, on=["SKU", "发货单号"], how="left")
+        missing_detail_mask = (
+            result_df['物流商单号'].isna()
+            | result_df['运输方式'].isna()
+            | result_df['物流中心编码'].isna()
+            | result_df['店铺'].isna()
+        )
+        if missing_detail_mask.any():
+            missing_rows = result_df.loc[missing_detail_mask, ['发货单号', 'SKU']].drop_duplicates()
+            missing_text = "；".join(
+                f"发货单号:{row['发货单号']} SKU:{row['SKU']}"
+                for _, row in missing_rows.iterrows()
+            )
+            raise ValueError(
+                f"登记出运明细失败：装箱信息和发货单详情的SKU/发货单号匹配不上，请检查：{missing_text}"
+            )
 
         self._register_combined_cache[invoice_filepath] = result_df
         return result_df.copy()

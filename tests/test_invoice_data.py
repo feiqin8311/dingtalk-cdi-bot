@@ -152,6 +152,114 @@ class InvoiceFlowImportTests(unittest.TestCase):
 
 
 class InvoiceRegisterTargetSelectionTests(unittest.TestCase):
+    def test_register_combined_invoice_marks_non_virtual_warehouse_as_warehouse_shipping(self):
+        generator = CustomsDeclaration()
+
+        invoice_df = pd.DataFrame(
+            [
+                {
+                    "发货单号": "SHIP-001",
+                    "SKU": "SKU-1",
+                    "发货数量": 1,
+                    "箱数": 1,
+                    "总重量（kg）-箱子": 10,
+                    "总体积（m³）-箱子": 0.1,
+                    "国家": "美国",
+                    "单箱数量": 1,
+                    "货件单号": "FBA-1",
+                    "箱子毛重（kg）": 10,
+                    "箱子长度（cm）": 10,
+                    "箱子宽度（cm）": 10,
+                    "箱子高度（cm）": 10,
+                },
+                {
+                    "发货单号": "SHIP-002",
+                    "SKU": "SKU-2",
+                    "发货数量": 2,
+                    "箱数": 1,
+                    "总重量（kg）-箱子": 20,
+                    "总体积（m³）-箱子": 0.2,
+                    "国家": "美国",
+                    "单箱数量": 2,
+                    "货件单号": "FBA-2",
+                    "箱子毛重（kg）": 20,
+                    "箱子长度（cm）": 20,
+                    "箱子宽度（cm）": 20,
+                    "箱子高度（cm）": 20,
+                },
+            ]
+        )
+        invoice_details_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "SKU-1",
+                    "运输方式": "海派",
+                    "物流商单号": "INV-001",
+                    "店铺": "EZARC",
+                    "物流中心编码": "ONT6",
+                    "发货单号": "SHIP-001",
+                    "发货仓库（单据）": "杭州虚拟仓",
+                    "物流商": "物流商A",
+                },
+                {
+                    "SKU": "SKU-2",
+                    "运输方式": "海派",
+                    "物流商单号": "INV-001",
+                    "店铺": "EZARC",
+                    "物流中心编码": "ONT6",
+                    "发货单号": "SHIP-002",
+                    "发货仓库（单据）": "义乌仓",
+                    "物流商": "物流商A",
+                },
+            ]
+        )
+
+        with patch.object(generator, "_read_excel_cached", side_effect=[invoice_df, invoice_details_df]):
+            result = generator.register_combined_invoice("invoice.xlsx")
+
+        self.assertEqual(result["发货仓库（单据）"].tolist(), ["工厂直发", "仓库发货"])
+
+    def test_register_combined_invoice_raises_when_detail_sku_has_unmatched_suffix(self):
+        generator = CustomsDeclaration()
+
+        invoice_df = pd.DataFrame(
+            [
+                {
+                    "发货单号": "SHIP-001",
+                    "SKU": "T19104A",
+                    "发货数量": 100,
+                    "箱数": 2,
+                    "总重量（kg）-箱子": 22,
+                    "总体积（m³）-箱子": 0.03,
+                    "国家": "日本",
+                    "单箱数量": 50,
+                    "货件单号": "FBA-1",
+                    "箱子毛重（kg）": 11,
+                    "箱子长度（cm）": 16,
+                    "箱子宽度（cm）": 32,
+                    "箱子高度（cm）": 29,
+                }
+            ]
+        )
+        invoice_details_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "T19104AJP",
+                    "运输方式": "海卡",
+                    "物流商单号": "26TL038",
+                    "店铺": "TOLESA JP-JP",
+                    "物流中心编码": "XJE2",
+                    "发货单号": "SHIP-001",
+                    "发货仓库（单据）": "余杭新仓库",
+                    "物流商": "浙江凯西国际货运代理有限公司",
+                }
+            ]
+        )
+
+        with patch.object(generator, "_read_excel_cached", side_effect=[invoice_df, invoice_details_df]):
+            with self.assertRaisesRegex(ValueError, "T19104A"):
+                generator.register_combined_invoice("invoice.xlsx")
+
     def test_build_invoicing_register_uses_company_title_instead_of_first_brand(self):
         generator = CustomsDeclaration()
         generator.company_info_index = 4

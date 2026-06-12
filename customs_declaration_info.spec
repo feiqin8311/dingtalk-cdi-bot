@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['D:\\Projects\\dingtalk-bot\\dingtalk-cdi-bot\\ui_pyqt.py'],
+    ['ui_pyqt.py'],
     pathex=[],
     binaries=[],
     datas=[],
