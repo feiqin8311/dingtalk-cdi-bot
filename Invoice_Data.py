@@ -28,6 +28,7 @@ from app.core.logging import get_log_dir, log_message as core_log_message
 from app.core.metrics import append_call_record as core_append_call_record
 from app.core.page_setup import apply_persistent_page_setup as core_apply_persistent_page_setup
 from app.core.page_setup import set_excel_page_view as core_set_excel_page_view
+from app.core.text_layout import calculate_wrapped_text_height
 from app.services.declared_price_service import select_declared_price_columns
 from app.services.elements_service import find_data_group as shared_find_data_group
 from app.services.freight_service import calculate_shipping_costs as shared_calculate_shipping_costs
@@ -203,11 +204,11 @@ class CustomsDeclaration:
             },
             {
                 "company_name_zh": "杭州鲁米亚科技有限公司",
-                "company_name_en": "Hangzhou Lumiya Technology Co., Ltd",
-                "consignor": "Hangzhou Lumiya Technology Co., Ltd\nADD:Room 403-5, Building 9, Yunkong Chengfeng Zhizhu, Wuchang Street, Yuhang District, Hangzhou, Zhejiang\nTel：0571-85236685",
+                "company_name_en": "Hangzhou Lumiya Technology Co., Ltd.",
+                "consignor": "Hangzhou Lumiya Technology Co., Ltd.\nAdd: Rm W318-2, Fl.3, Unit 5, Bld. 10 Area E, Aicheng Str.1#, Wuchang Street, Yuhang District, Hangzhou, Zhejiang, 311121, CN\nTel：0571-85236685",
                 "domestic_shipper": "杭州鲁米亚科技有限公司 (3301969CW7)",
                 "production_sales_unit": "杭州鲁米亚科技有限公司 91330106MA2GNY10XB",
-                "bank_informations": "Bank information:                                                                                                                                                                                                                                                     \nBENEFICIARY NAME: Hangzhou Lumiya Technology Co., Ltd\nA/C NO: 71012025000126517\nADDRESS: Room 403-5, Building 9, Yunkong Chengfeng Zhizhu, Wuchang Street, Yuhang District, Hangzhou, Zhejiang\nBENEFICIARY BANK:  BANK OF NINGBO\nSWIFT BIC:  BKNBCN2N\nBANK ADDRESS: NO. 700 NINGNAN SOUTH ROAD, NINGBO, P.R.CHINA, 315100\nCORRESPONDENT BANK: BANK OF AMERICA N.A. NEW YORK NY US \nSWIFT BIC: BOFAUS3NXXX",
+                "bank_informations": "Bank information:                                                                                                                                                                                                                                                     \nBENEFICIARY NAME: Hangzhou Lumiya Technology Co., Ltd.\nA/C NO: 71012025000126517\nADDRESS: Rm W318-2, Fl.3, Unit 5, Bld. 10 Area E, Aicheng Str.1#, Wuchang Street, Yuhang District, Hangzhou, Zhejiang, 311121, CN\nBENEFICIARY BANK:  BANK OF NINGBO\nSWIFT BIC:  BKNBCN2N\nBANK ADDRESS: NO. 700 NINGNAN SOUTH ROAD, NINGBO, P.R.CHINA, 315100\nCORRESPONDENT BANK: BANK OF AMERICA N.A. NEW YORK NY US \nSWIFT BIC: BOFAUS3NXXX",
                 "customs_declaration_price": "鲁米亚报关单价",
                 "domestic_source_of_goods": "33019 杭州其他",
                 "images": ['image2', 'image3'],
@@ -567,6 +568,7 @@ class CustomsDeclaration:
         invoice_df = invoice_df.ffill()
         if '总体积（m³）-箱子' in invoice_df.columns:
             volume_series = pd.to_numeric(invoice_df['总体积（m³）-箱子'], errors='coerce')
+            invoice_df['总体积（m³）-箱子'] = volume_series.astype(float)
             invoice_df.loc[volume_series == 0, '总体积（m³）-箱子'] = 0.01
 
         # 货件单号列去重后转列表,得到唛头
@@ -662,13 +664,54 @@ class CustomsDeclaration:
         return invoice_df, invoice_details_df, product_df
 
     def update_shipment_quantity(self, df: pd.DataFrame) -> pd.DataFrame:
-        """如果同一个发货单号里面，如果有重复的SKU，就重新计算发货数量，发货数量 = 箱数 * 单箱数量，否则就不处理"""
+        """拼箱中按每条实体箱记录计算对应 SKU 数量。"""
 
-        dup_mask = df.duplicated(subset=["发货单号", "SKU"], keep=False)
-        df.loc[dup_mask, "发货数量"] = df.loc[dup_mask, "箱数"] * df.loc[
-            dup_mask, "单箱数量"]
+        result_df = df.copy()
+        dup_mask = result_df.duplicated(subset=["发货单号", "SKU"], keep=False)
+        result_df.loc[dup_mask, "发货数量"] = (
+            result_df.loc[dup_mask, "箱数"] * result_df.loc[dup_mask, "单箱数量"]
+        )
+        return result_df
 
-        return df
+    def consolidate_lcl_shipping_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        """按实体箱汇总拼箱登记行，避免共享箱被多个 SKU 重复计数。"""
+
+        carton_columns = [
+            '箱数', '箱子毛重（kg）', '箱子长度（cm）', '箱子宽度（cm）', '箱子高度（cm）',
+            '总重量（kg）-箱子', '总体积（m³）-箱子',
+        ]
+        total_columns = ['箱数', '总重量（kg）-箱子', '总体积（m³）-箱子']
+        result_rows = []
+
+        for _, shipment_df in df.groupby('发货单号', sort=False):
+            sku_order = shipment_df['SKU'].drop_duplicates().tolist()
+            sku_rows = {}
+            for sku in sku_order:
+                sku_df = shipment_df[shipment_df['SKU'] == sku]
+                row = sku_df.iloc[0].copy()
+                row['发货数量'] = pd.to_numeric(sku_df['发货数量'], errors='coerce').sum()
+                row[carton_columns] = np.nan
+                sku_rows[sku] = row
+
+            for _, carton_df in shipment_df.groupby(carton_columns, dropna=False, sort=False):
+                carton_row = carton_df.iloc[0]
+                owner_row = sku_rows[carton_row['SKU']]
+                has_carton = pd.notna(owner_row['箱数'])
+
+                for column in carton_columns:
+                    if column not in total_columns or not has_carton:
+                        owner_row[column] = carton_row[column]
+
+                if has_carton:
+                    for column in total_columns:
+                        owner_row[column] = (
+                            pd.to_numeric(owner_row[column], errors='coerce')
+                            + pd.to_numeric(carton_row[column], errors='coerce')
+                        )
+
+            result_rows.extend(sku_rows[sku] for sku in sku_order)
+
+        return pd.DataFrame(result_rows).reset_index(drop=True)
 
     def check_data(self, df: pd.DataFrame, mode: str) -> None:
         """如果merge_df的*SKU列有为NaN的值，就报错，将那一行数据提示输出"""
@@ -1272,11 +1315,21 @@ class CustomsDeclaration:
 
         # 最大行数
         max_row = len(excel_data)
+        consignor_height = calculate_wrapped_text_height(
+            self.shipping_details['consignor'], 51, characters_per_line=75
+        )
+        recipient_height = calculate_wrapped_text_height(
+            self.shipping_details['recipient'], 90, characters_per_line=75
+        )
 
         # 填充数据
         for row_idx, row_data in enumerate(excel_data, 1):
             # 设置行高
-            if row_idx in [6, 7]:
+            if row_idx == 4:
+                ws.row_dimensions[row_idx].height = consignor_height - 25.5
+            elif row_idx == 6:
+                ws.row_dimensions[row_idx].height = recipient_height - 45
+            elif row_idx == 7:
                 ws.row_dimensions[row_idx].height = 45
             else:
                 ws.row_dimensions[row_idx].height = 25.5
@@ -1499,9 +1552,12 @@ class CustomsDeclaration:
         self.seeting_excel_format(ws, column_widths, "column_widths")
 
         # 设置行高
+        recipient_height = calculate_wrapped_text_height(
+            self.shipping_details['recipient'], 90, characters_per_line=75
+        )
         row_heights = {
             1: 30.65, 2: 24, 3: 23.5, 4: 12,
-            5: 45, 6: 45, 7: 19.5, 8: 43.5
+            5: recipient_height - 45, 6: 45, 7: 19.5, 8: 43.5
         }
         for i in range(9, 9 + data_row):
             row_heights[i] = 30
@@ -1654,9 +1710,12 @@ class CustomsDeclaration:
         self.seeting_excel_format(ws, column_widths, "column_widths")
 
         # 设置行高
+        recipient_height = calculate_wrapped_text_height(
+            self.shipping_details['recipient'], 90, characters_per_line=60
+        )
         row_heights = {
             1: 30.65, 2: 23.5, 3: 27, 4: 13,
-            5: 45, 6: 45, 7: 33.75, 8 + data_row: 15
+            5: recipient_height - 45, 6: 45, 7: 33.75, 8 + data_row: 15
         }
         for i in range(8, 8 + data_row):
             row_heights[i] = 30
@@ -1822,9 +1881,15 @@ class CustomsDeclaration:
         self.seeting_excel_format(ws, column_widths, "column_widths")
 
         # 设置行高
+        consignor_height = calculate_wrapped_text_height(
+            self.shipping_details['consignor'], 57, characters_per_line=70
+        )
+        recipient_height = calculate_wrapped_text_height(
+            self.shipping_details['recipient'], 90, characters_per_line=70
+        )
         row_heights = {
-            1: 30.65, 2: 24, 3: 23.5, 4: 57,
-            5: 90, 6: 14.25, 7: 16, 8: 16,
+            1: 30.65, 2: 24, 3: 23.5, 4: consignor_height,
+            5: recipient_height, 6: 14.25, 7: 16, 8: 16,
             9 + data_row: 30,
             max_row - 2: 117,
             max_row - 1: 15,
@@ -1906,6 +1971,9 @@ class CustomsDeclaration:
         if self.result_df['是否含金刚石'].any():
             self.control_info = '不属于管制物项'
 
+        invoice_number = str(self.shipping_details.get('invoice_number', '')).strip()
+        customs_mode_text = f"9710({invoice_number})" if invoice_number else "9710"
+
         # 填充数据
         excel_data = [
             ["中华人民共和国海关出口货物报关单", "", "", "", "", "", "", "", "", "", "", "", "", "", ""],
@@ -1917,7 +1985,7 @@ class CustomsDeclaration:
              self.get_customs_transport_method_display(self.shipping_details.get('transportation_method', '')),
              "", "", "", "", "", "", "", "", "", ""],
             ["生产销售单位", "", "", "", "监管方式", "", "", "征免性质", "", "", "许可证号", "", "", "", ""],
-            [self.shipping_details['production_sales_unit'], "", "", "", "9710", "", "", "一般征税", "", "", "", "", "",
+            [self.shipping_details['production_sales_unit'], "", "", "", customs_mode_text, "", "", "一般征税", "", "", "", "", "",
              "",
              ""],
             ["合同协议号", "", "", "", "贸易国（地区）", "", "", "运抵国（地区）", "", "", "指运港", "", "离境口岸", "",
@@ -2433,8 +2501,10 @@ class CustomsDeclaration:
             lambda x: "工厂直发" if x == "杭州虚拟仓" else "仓库发货"
         )
 
-        # 合并数据
-        result_df = invoice_df.merge(invoice_details_df, on=["SKU", "发货单号"], how="left")
+        # 装箱信息可为同一SKU拆出多行；详情信息只提供每个SKU的公共物流属性。
+        detail_keys = ['SKU', '发货单号']
+        invoice_details_df = invoice_details_df.drop_duplicates(subset=detail_keys, keep='first')
+        result_df = invoice_df.merge(invoice_details_df, on=detail_keys, how="left")
         missing_detail_mask = (
             result_df['物流商单号'].isna()
             | result_df['运输方式'].isna()
@@ -2522,7 +2592,7 @@ class CustomsDeclaration:
             raise Exception(f"{label}无法写入：{file_path}，原因：{e}")
 
     def register_shipping_invoice_number(self, invoice_filepath: str,
-                                         invoice_number_register_filepath: str) -> tuple[int, int]:
+                                         invoice_number_register_filepath: str) -> tuple[int, int, int]:
         """登记出货发票号登记表"""
 
         sheet_name = '出运明细'
@@ -2540,19 +2610,7 @@ class CustomsDeclaration:
         if self.lcl_flag:
             # 如果同一个发货单号里面，如果有重复的SKU，就重新计算发货数量，发货数量 = 箱数 * 单箱数量，否则就不处理
             result_df = self.update_shipment_quantity(result_df)
-
-            # 标记需要处理的列
-            cols_to_check = ['箱数', '箱子毛重（kg）', '箱子长度（cm）', '箱子宽度（cm）', '箱子高度（cm）', '总重量（kg）-箱子',
-                             '总体积（m³）-箱子']
-
-            # 按发货单号分组
-            for shipment_id, group in result_df.groupby('发货单号'):
-                # 在每组内进一步按箱数、重量、体积分组
-                for _, subgroup in group.groupby(cols_to_check):
-                    if len(subgroup) > 1:
-                        # 保留第一行，其他行的指定列设置为NaN
-                        indices_to_update = subgroup.index[1:]
-                        result_df.loc[indices_to_update, cols_to_check] = None
+            result_df = self.consolidate_lcl_shipping_rows(result_df)
 
         # 删除不需要的列
         result_df = result_df[
@@ -2615,7 +2673,7 @@ class CustomsDeclaration:
             self.verify_register_written(
                 invoice_number_register_filepath, sheet_name, column_name, self.shipping_details['invoice_number']
             )
-            return deleted_rows, actual_total
+            return deleted_rows, actual_total, len(rows)
 
         except Exception as e:
             # 如果是PermissionError，说明有人占用文件
@@ -2675,20 +2733,33 @@ class CustomsDeclaration:
         # 重命名列
         customs_declaration_df.rename(columns={'发货数量': '数量', '报关中文品名': '开票/报关品名'}, inplace=True)
 
-        # 合并数据,如果是素桐，就都用报关资料的数据，否则用发货单 + 报关资料的数据
+        # 合并数据：素桐以报关汇总结果为准；其他主体按登记明细行顺序填入报关汇总数据。
         if self.company_info_index == 2:
-            register_df = customs_declaration_df.merge(merged_df, on="SKU", how="left")
+            merged_register_df = (
+                merged_df
+                .sort_values(["SKU", "物流商单号"])
+                .drop_duplicates(subset=["SKU"], keep="first")
+            )
+            register_df = customs_declaration_df.merge(
+                merged_register_df[
+                    [
+                        "SKU",
+                        "物流商单号",
+                        "出口日期",
+                        "预录单编号",
+                        "报关方式（9710/一般贸易）",
+                        "成交方式(FOB/CIF/CFR)",
+                        "店铺",
+                    ]
+                ],
+                on="SKU",
+                how="left",
+            )
         else:
-            # 将索引转成新的列
             merged_df.reset_index(inplace=True)
-            merged_df['index'] = merged_df['index'].astype(int)
-
             customs_declaration_df.reset_index(inplace=True)
-            customs_declaration_df['index'] = customs_declaration_df['index'].astype(int)
             customs_declaration_df.drop(columns=['SKU'], inplace=True)
-
-            register_df = merged_df.merge(customs_declaration_df, on="index", how="left")
-            # 删除index列
+            register_df = merged_df.merge(customs_declaration_df, on='index', how='left')
             register_df.drop(columns=['index'], inplace=True)
 
         # 店铺
@@ -2716,6 +2787,10 @@ class CustomsDeclaration:
 
         # 替换店铺名称
         register_df.loc[register_df['店铺'] == "SIXPRAY", '店铺'] = "TOLESA"
+        if self.company_info_index == 2:
+            register_df = register_df.drop_duplicates().reset_index(drop=True)
+        else:
+            register_df = register_df.reset_index(drop=True)
         return register_df, register_filepath, sheet_name, brand, original_rows
 
     def write_invoicing_register(self, register_df: pd.DataFrame, register_filepath: str,
@@ -2843,8 +2918,7 @@ class CustomsDeclaration:
             # 登记出货发票号登记表
             sheet_name = '出运明细'
             shipping_original_rows = self.find_last_data_row(invoice_number_register_filepath, sheet_name)
-            insert_rows = len(self.register_combined_invoice(invoice_filepath))
-            deleted_rows, actual_rows = self.register_shipping_invoice_number(
+            deleted_rows, actual_rows, insert_rows = self.register_shipping_invoice_number(
                 invoice_filepath, invoice_number_register_filepath
             )
             expected_rows = shipping_original_rows - deleted_rows + insert_rows

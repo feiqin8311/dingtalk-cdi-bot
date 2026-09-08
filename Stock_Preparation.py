@@ -29,6 +29,7 @@ from app.core.logging import get_log_dir, log_message as core_log_message
 from app.core.metrics import append_call_record as core_append_call_record
 from app.core.page_setup import apply_persistent_page_setup as core_apply_persistent_page_setup
 from app.core.page_setup import set_excel_page_view as core_set_excel_page_view
+from app.core.text_layout import calculate_wrapped_text_height
 from app.services.declared_price_service import select_declared_price_columns
 from app.services.elements_service import find_data_group as shared_find_data_group
 from app.services.freight_service import calculate_shipping_costs as shared_calculate_shipping_costs
@@ -61,6 +62,13 @@ _STOCK_PACKING_COLS = [
     '备货数量', '单箱数量', '箱数', '箱子毛重（kg）', '箱子长度（cm）', '箱子宽度（cm）', '箱子高度（cm）',
     '总重量（kg）-箱子', '总体积（m³）-箱子'
 ]
+_WAREHOUSE_RECIPIENT_MAP = (
+    ("AWD", "Amazon.com Services, Inc."),
+    ("topg-德克萨斯州", "TOPG INTERNATIONAL LIMITED\n5115 south shaver st,Houston,TX,77034"),
+    ("FBT仓-TIKTOK", "Fulfilled by Tiktok"),
+    ("仓盛美中仓", "ShipSage\n460 Gibraltar Drive, Bolingbrook IL 60440, US"),
+    ("海盟-新泽西", "GCE Logistics East Inc.\n545 Monmouth Rd, Jackson Township, NJ 08527"),
+)
 _FONT_CACHE = {}
 _ALIGNMENT_CACHE = {}
 _FONT_CLS = Font
@@ -201,11 +209,11 @@ class CustomsDeclaration:
             },
             {
                 "company_name_zh": "杭州鲁米亚科技有限公司",
-                "company_name_en": "Hangzhou Lumiya Technology Co., Ltd",
-                "consignor": "Hangzhou Lumiya Technology Co., Ltd\nADD:Room 403-5, Building 9, Yunkong Chengfeng Zhizhu, Wuchang Street, Yuhang District, Hangzhou, Zhejiang\nTel：0571-85236685",
+                "company_name_en": "Hangzhou Lumiya Technology Co., Ltd.",
+                "consignor": "Hangzhou Lumiya Technology Co., Ltd.\nAdd: Rm W318-2, Fl.3, Unit 5, Bld. 10 Area E, Aicheng Str.1#, Wuchang Street, Yuhang District, Hangzhou, Zhejiang, 311121, CN\nTel：0571-85236685",
                 "domestic_shipper": "杭州鲁米亚科技有限公司 (3301969CW7)",
                 "production_sales_unit": "杭州鲁米亚科技有限公司 91330106MA2GNY10XB",
-                "bank_informations": "Bank information:                                                                                                                                                                                                                                                     \nBENEFICIARY NAME: Hangzhou Lumiya Technology Co., Ltd\nA/C NO: 71012025000126517\nADDRESS: Room 403-5, Building 9, Yunkong Chengfeng Zhizhu, Wuchang Street, Yuhang District, Hangzhou, Zhejiang\nBENEFICIARY BANK:  BANK OF NINGBO\nSWIFT BIC:  BKNBCN2N\nBANK ADDRESS: NO. 700 NINGNAN SOUTH ROAD, NINGBO, P.R.CHINA, 315100\nCORRESPONDENT BANK: BANK OF AMERICA N.A. NEW YORK NY US \nSWIFT BIC: BOFAUS3NXXX",
+                "bank_informations": "Bank information:                                                                                                                                                                                                                                                     \nBENEFICIARY NAME: Hangzhou Lumiya Technology Co., Ltd.\nA/C NO: 71012025000126517\nADDRESS: Rm W318-2, Fl.3, Unit 5, Bld. 10 Area E, Aicheng Str.1#, Wuchang Street, Yuhang District, Hangzhou, Zhejiang, 311121, CN\nBENEFICIARY BANK:  BANK OF NINGBO\nSWIFT BIC:  BKNBCN2N\nBANK ADDRESS: NO. 700 NINGNAN SOUTH ROAD, NINGBO, P.R.CHINA, 315100\nCORRESPONDENT BANK: BANK OF AMERICA N.A. NEW YORK NY US \nSWIFT BIC: BOFAUS3NXXX",
                 "customs_declaration_price": "鲁米亚报关单价",
                 "domestic_source_of_goods": "33019 杭州其他",
                 "images": ['image2', 'image3'],
@@ -459,6 +467,16 @@ class CustomsDeclaration:
                 .str.replace(r'^AE', '', regex=True, case=False))
 
     @staticmethod
+    def resolve_warehouse_recipient(warehouse_series: pd.Series) -> str:
+        """根据收货仓库关键词匹配收件人"""
+        warehouses = warehouse_series.dropna().astype(str)
+        for keyword, recipient in _WAREHOUSE_RECIPIENT_MAP:
+            if warehouses.str.contains(keyword, case=False, na=False, regex=False).any():
+                return recipient
+        unique_warehouses = "，".join(warehouses.drop_duplicates().tolist()) or "(空)"
+        raise ValueError(f"收货仓库未匹配到收件人：{unique_warehouses}，请维护映射规则。")
+
+    @staticmethod
     def find_data_group(elements_file_path: str, result_df: pd.DataFrame) -> List[List[str]]:
         """查找要素表的数据组"""
         return shared_find_data_group(elements_file_path, result_df, cache=_ELEMENTS_GROUP_CACHE)
@@ -619,18 +637,11 @@ class CustomsDeclaration:
         brand_candidates = shop_series[shop_series != ""]
         self.shipping_details['brand'] = brand_candidates.iloc[0] if not brand_candidates.empty else ""
 
-        # 收件人：收货仓库含 AWD -> Amazon，其它固定香港地址
+        # 收件人：按收货仓库关键词匹配
         warehouse_series = invoice_details_df['收货仓库'].dropna().astype(str)
         is_awd = warehouse_series.str.contains("AWD", case=False, na=False).any()
         self.shipping_details['is_awd'] = is_awd
-        if is_awd:
-            self.shipping_details['recipient'] = "Amazon.com Services, Inc."
-        else:
-            self.shipping_details['recipient'] = (
-                "Hong Kong Shin York Trading Limited\n"
-                "Add: ROOM 1201, 12/F, TAI SANG BANK BUILDING, 130-132 DES VOEUX ROAD, CENTRAL, HONG KONG\n"
-                "Tel：18067967511"
-            )
+        self.shipping_details['recipient'] = self.resolve_warehouse_recipient(warehouse_series)
 
         # 目的国固定美国，目的港不填
         self.shipping_details['country_zh'] = "美国"
@@ -657,16 +668,10 @@ class CustomsDeclaration:
         if not self.shipping_details['transportation_method']:
             raise ValueError("备货单的物流渠道为空！")
 
-        # 默认币别
+        # 币别固定美元
         self.shipping_details['currency'] = "USD"
         self.shipping_details['currency_cn'] = "美元"
         self.shipping_details['currency_symbol'] = "$"
-
-        # 易达且非 AWD：改为人民币
-        if self.company_info_index == 0 and not is_awd:
-            self.shipping_details['currency'] = "CNY"
-            self.shipping_details['currency_cn'] = "人民币"
-            self.shipping_details['currency_symbol'] = "¥"
 
         # 读取备货单装箱信息
         invoice_df = self._read_excel_cached(
@@ -680,6 +685,7 @@ class CustomsDeclaration:
         invoice_df['SKU'] = self.normalize_stock_sku(invoice_df['SKU'])
         if '总体积（m³）-箱子' in invoice_df.columns:
             volume_series = pd.to_numeric(invoice_df['总体积（m³）-箱子'], errors='coerce')
+            invoice_df['总体积（m³）-箱子'] = volume_series.astype(float)
             invoice_df.loc[volume_series == 0, '总体积（m³）-箱子'] = 0.01
 
         return invoice_df, invoice_details_df, product_df
@@ -1266,11 +1272,21 @@ class CustomsDeclaration:
 
         # 最大行数
         max_row = len(excel_data)
+        consignor_height = calculate_wrapped_text_height(
+            self.shipping_details['consignor'], 51, characters_per_line=75
+        )
+        recipient_height = calculate_wrapped_text_height(
+            self.shipping_details['recipient'], 90, characters_per_line=75
+        )
 
         # 填充数据
         for row_idx, row_data in enumerate(excel_data, 1):
             # 设置行高
-            if row_idx in [6, 7]:
+            if row_idx == 4:
+                ws.row_dimensions[row_idx].height = consignor_height - 25.5
+            elif row_idx == 6:
+                ws.row_dimensions[row_idx].height = recipient_height - 45
+            elif row_idx == 7:
                 ws.row_dimensions[row_idx].height = 45
             else:
                 ws.row_dimensions[row_idx].height = 25.5
@@ -1547,9 +1563,12 @@ class CustomsDeclaration:
         self.seeting_excel_format(ws, column_widths, "column_widths")
 
         # 设置行高
+        recipient_height = calculate_wrapped_text_height(
+            self.shipping_details['recipient'], 90, characters_per_line=75
+        )
         row_heights = {
             1: 30.65, 2: 24, 3: 23.5, 4: 12,
-            5: 45, 6: 45, 7: 19.5, 8: 43.5
+            5: recipient_height - 45, 6: 45, 7: 19.5, 8: 43.5
         }
         for i in range(9, 9 + data_row):
             row_heights[i] = 30
@@ -1745,9 +1764,12 @@ class CustomsDeclaration:
         self.seeting_excel_format(ws, column_widths, "column_widths")
 
         # 设置行高
+        recipient_height = calculate_wrapped_text_height(
+            self.shipping_details['recipient'], 90, characters_per_line=60
+        )
         row_heights = {
             1: 30.65, 2: 23.5, 3: 27, 4: 13,
-            5: 45, 6: 45, 7: 33.75, 8 + data_row: 15
+            5: recipient_height - 45, 6: 45, 7: 33.75, 8 + data_row: 15
         }
         for i in range(8, 8 + data_row):
             row_heights[i] = 30
@@ -1964,9 +1986,15 @@ class CustomsDeclaration:
         self.seeting_excel_format(ws, column_widths, "column_widths")
 
         # 设置行高
+        consignor_height = calculate_wrapped_text_height(
+            self.shipping_details['consignor'], 57, characters_per_line=70
+        )
+        recipient_height = calculate_wrapped_text_height(
+            self.shipping_details['recipient'], 90, characters_per_line=70
+        )
         row_heights = {
-            1: 30.65, 2: 24, 3: 23.5, 4: 57,
-            5: 90, 6: 14.25, 7: 16, 8: 16,
+            1: 30.65, 2: 24, 3: 23.5, 4: consignor_height,
+            5: recipient_height, 6: 14.25, 7: 16, 8: 16,
             9 + data_row: 30,
             max_row - 2: 117,
             max_row - 1: 15,
@@ -2048,11 +2076,14 @@ class CustomsDeclaration:
         if self.result_df['是否含金刚石'].any():
             self.control_info = '不属于管制物项'
 
-        # 监管方式：AWD -> 9710，非 AWD -> 一般贸易
-        customs_mode = "9710" if self.shipping_details.get('is_awd', False) else "一般贸易"
+        invoice_number = str(self.shipping_details.get('invoice_number', '')).strip()
+        is_awd = self.shipping_details.get('is_awd', False)
 
-        # 境外收货人
-        overseas_consignee = "Amazon.com Services, Inc." if self.shipping_details.get('is_awd', False) else "Hong Kong Shin York Trading Limited"
+        # 监管方式统一为 9710(发票号)
+        customs_mode = f"9710({invoice_number})" if invoice_number else "9710"
+
+        # 境外收货人：取收件人第一行
+        overseas_consignee = str(self.shipping_details.get('recipient', '')).split('\n')[0]
 
         # 填充数据
         excel_data = [
@@ -2909,16 +2940,8 @@ class CustomsDeclaration:
             # 如果同一个备货单号里面，如果有重复的SKU，就重新计算备货数量，备货数量 = 箱数 * 单箱数量，否则就不处理
             invoice_df = self.update_shipment_quantity(invoice_df)
 
-        is_awd = self.shipping_details.get('is_awd')
-        if is_awd is None:
-            warehouse_series = invoice_df['收货仓库'].fillna('').astype(str)
-            is_awd = warehouse_series.str.contains("AWD", case=False, na=False).any()
-            self.shipping_details['is_awd'] = is_awd
-
-        # 报关渠道：AWD -> 亚马逊，非 AWD -> 欣耀报关
-        customs_declaration_channels = "亚马逊" if is_awd else "欣耀报关"
-        # 报关方式：AWD -> 9710，非 AWD -> 一般贸易
-        customs_declaration_method = 9710 if is_awd else "一般贸易"
+        customs_declaration_channels = "海外仓"
+        customs_declaration_method = 9710
 
         if not self.shipping_details.get('invoice_number'):
             tracking_df = self._read_excel_cached(

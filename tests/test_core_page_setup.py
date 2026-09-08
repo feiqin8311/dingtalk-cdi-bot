@@ -3,6 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import Mock, patch
 
 from openpyxl import Workbook, load_workbook
 
@@ -70,6 +71,31 @@ class CorePageSetupTests(unittest.TestCase):
         finally:
             if "reloaded" in locals():
                 reloaded.close()
+            os.remove(path)
+
+    def test_set_excel_page_view_uses_an_isolated_office_process(self):
+        wb = Workbook()
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            path = tmp.name
+        app = Mock()
+        office_workbook = Mock()
+        office_workbook.Worksheets = []
+        app.Workbooks.Open.return_value = office_workbook
+
+        try:
+            wb.save(path)
+            wb.close()
+
+            with patch("app.core.page_setup.win32") as win32:
+                win32.DispatchEx.return_value = app
+                set_excel_page_view(path)
+
+            win32.Dispatch.assert_not_called()
+            win32.DispatchEx.assert_called_once_with("Ket.Application")
+            office_workbook.Save.assert_called_once_with()
+            office_workbook.Close.assert_called_once_with(False)
+            app.Quit.assert_called_once_with()
+        finally:
             os.remove(path)
 
 

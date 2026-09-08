@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from openpyxl import load_workbook
 
+from app.core.office_automation import start_isolated_office_application
+
 try:
     import win32com.client as win32
 except Exception:
@@ -24,27 +26,30 @@ def set_excel_page_view(file_path: str, enable_com: bool = True) -> None:
     if not enable_com or win32 is None:
         return
 
-    app = None
-    for prog_id in ("Ket.Application", "WPS.Application", "Excel.Application"):
-        try:
-            app = win32.Dispatch(prog_id)
-            if app is not None:
-                break
-        except Exception:
-            continue
+    app = start_isolated_office_application(win32)
 
     if app is None or not hasattr(app, "Workbooks"):
         return
 
+    office_workbook = None
     try:
-        workbook = app.Workbooks.Open(file_path)
-        for sheet in workbook.Worksheets:
+        office_workbook = app.Workbooks.Open(file_path)
+        for sheet in office_workbook.Worksheets:
             sheet.Activate()
             page_setup = sheet.PageSetup
             page_setup.Zoom = False
             page_setup.FitToPagesWide = 1
             page_setup.FitToPagesTall = 1
-        workbook.Save()
-        workbook.Close()
+        office_workbook.Save()
     except Exception:
-        return
+        pass
+    finally:
+        if office_workbook is not None:
+            try:
+                office_workbook.Close(False)
+            except Exception:
+                pass
+        try:
+            app.Quit()
+        except Exception:
+            pass

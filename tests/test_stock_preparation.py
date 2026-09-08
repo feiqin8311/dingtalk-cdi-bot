@@ -3,7 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -19,6 +19,135 @@ sys.modules.setdefault("win32com", win32com_module)
 sys.modules.setdefault("win32com.client", win32com_client)
 
 from stock_preparation import CustomsDeclaration, _ELEMENTS_GROUP_CACHE
+
+
+class StockBasicInformationTests(unittest.TestCase):
+    def test_zero_volume_integer_column_is_normalized_to_float_before_fallback(self):
+        generator = CustomsDeclaration()
+        stock_details_df = pd.DataFrame(
+            {
+                "备货单号": ["STOCK-001"],
+                "发货仓库（单据）": ["杭州虚拟仓"],
+                "收货仓库": ["EZARC NA-US美国仓(AWD)"],
+                "sku": ["922101"],
+            }
+        )
+        product_df = pd.DataFrame(
+            {
+                "*SKU": ["922101"],
+                "报关中文品名": ["测试品名"],
+                "单品毛重(g)": [100],
+                "外箱规格长(cm)": [10],
+                "外箱规格宽(cm)": [10],
+                "外箱规格高(cm)": [10],
+                "单箱数量(pcs)": [1],
+                "材质": ["钢"],
+                "货源地": ["杭州"],
+                "供应商名称": ["供应商A"],
+                "报关用采购成本(CNY)": [1],
+                "品牌": ["EZARC"],
+            }
+        )
+        tracking_df = pd.DataFrame(
+            {
+                "备货单号": ["STOCK-001"],
+                "物流商": ["物流商A"],
+                "物流渠道": ["海派"],
+                "查询单号": ["INV-001"],
+            }
+        )
+        packing_df = pd.DataFrame(
+            {
+                "备货单号": ["STOCK-001"],
+                "SKU": ["922101"],
+                "总体积（m³）-箱子": pd.Series([0], dtype="int64"),
+            }
+        )
+
+        with patch.object(
+            generator,
+            "_read_excel_cached",
+            side_effect=[stock_details_df, product_df, tracking_df, packing_df],
+        ):
+            result_df, _, _ = generator.get_basic_information("stock.xlsx", "site.xlsx", "product.xlsx")
+
+        self.assertEqual(result_df.loc[0, "总体积（m³）-箱子"], 0.01)
+        self.assertEqual(result_df["总体积（m³）-箱子"].dtype.kind, "f")
+        self.assertEqual(generator.shipping_details["recipient"], "Amazon.com Services, Inc.")
+        self.assertTrue(generator.shipping_details["is_awd"])
+        self.assertEqual(generator.shipping_details["currency"], "USD")
+        self.assertEqual(generator.shipping_details["currency_symbol"], "$")
+
+    def test_non_awd_currency_stays_usd(self):
+        generator = CustomsDeclaration()
+        stock_details_df = pd.DataFrame(
+            {
+                "备货单号": ["STOCK-001"],
+                "发货仓库（单据）": ["杭州虚拟仓"],
+                "收货仓库": ["FBT仓-TIKTOK"],
+                "sku": ["922101"],
+            }
+        )
+        product_df = pd.DataFrame(
+            {
+                "*SKU": ["922101"],
+                "报关中文品名": ["测试品名"],
+                "单品毛重(g)": [100],
+                "外箱规格长(cm)": [10],
+                "外箱规格宽(cm)": [10],
+                "外箱规格高(cm)": [10],
+                "单箱数量(pcs)": [1],
+                "材质": ["钢"],
+                "货源地": ["杭州"],
+                "供应商名称": ["供应商A"],
+                "报关用采购成本(CNY)": [1],
+                "品牌": ["EZARC"],
+            }
+        )
+        tracking_df = pd.DataFrame(
+            {
+                "备货单号": ["STOCK-001"],
+                "物流商": ["物流商A"],
+                "物流渠道": ["海派"],
+                "查询单号": ["INV-001"],
+            }
+        )
+        packing_df = pd.DataFrame(
+            {
+                "备货单号": ["STOCK-001"],
+                "SKU": ["922101"],
+                "总体积（m³）-箱子": pd.Series([0.1], dtype="float64"),
+            }
+        )
+
+        with patch.object(
+            generator,
+            "_read_excel_cached",
+            side_effect=[stock_details_df, product_df, tracking_df, packing_df],
+        ):
+            generator.get_basic_information("stock.xlsx", "site.xlsx", "product.xlsx")
+
+        self.assertFalse(generator.shipping_details["is_awd"])
+        self.assertEqual(generator.shipping_details["currency"], "USD")
+        self.assertEqual(generator.shipping_details["currency_cn"], "美元")
+        self.assertEqual(generator.shipping_details["currency_symbol"], "$")
+
+    def test_warehouse_recipient_mapping(self):
+        cases = [
+            ("EZARC NA-US美国仓(AWD)", "Amazon.com Services, Inc."),
+            ("topg-德克萨斯州", "TOPG INTERNATIONAL LIMITED\n5115 south shaver st,Houston,TX,77034"),
+            ("FBT仓-TIKTOK", "Fulfilled by Tiktok"),
+            ("仓盛美中仓 Bolingbrook", "ShipSage\n460 Gibraltar Drive, Bolingbrook IL 60440, US"),
+            ("海盟-新泽西", "GCE Logistics East Inc.\n545 Monmouth Rd, Jackson Township, NJ 08527"),
+        ]
+        for warehouse, recipient in cases:
+            with self.subTest(warehouse=warehouse):
+                series = pd.Series([warehouse])
+                self.assertEqual(CustomsDeclaration.resolve_warehouse_recipient(series), recipient)
+
+    def test_unmatched_warehouse_raises(self):
+        with self.assertRaisesRegex(ValueError, "收货仓库未匹配到收件人"):
+            CustomsDeclaration.resolve_warehouse_recipient(pd.Series(["未知仓库"]))
 
 
 class FindDataGroupOrderTests(unittest.TestCase):
@@ -166,7 +295,7 @@ class StockFlowBehaviorTests(unittest.TestCase):
         generator = DummyGenerator()
         flow = StockFlow(generator)
 
-        with patch("app.flows.stock_flow.openpyxl.Workbook", side_effect=[DummyWorkbook(), DummyWorkbook()]), \
+        with patch("app.flows.stock_flow.openpyxl.Workbook", return_value=DummyWorkbook()), \
                 patch("app.flows.stock_flow.render_detailed_list") as render_detailed_list, \
                 patch("app.flows.stock_flow.render_packing_list") as render_packing_list, \
                 patch("app.flows.stock_flow.render_bill") as render_bill, \
@@ -174,7 +303,10 @@ class StockFlowBehaviorTests(unittest.TestCase):
                 patch("app.flows.stock_flow.render_customs_declaration") as render_customs_declaration, \
                 patch("app.flows.stock_flow.render_elements_sheet") as render_elements_sheet, \
                 patch("app.flows.stock_flow.ensure_default_sheet_removed"), \
-                patch("app.flows.stock_flow.finalize_workbook_page_setup"):
+                patch("app.flows.stock_flow.finalize_workbook_page_setup"), \
+                patch("app.flows.stock_flow.os.makedirs"), \
+                patch("app.flows.stock_flow.export_workbook_to_pdf") as export_workbook_to_pdf, \
+                patch("app.flows.stock_flow.export_worksheet_to_pdf") as export_worksheet_to_pdf:
             flow.generate_all_documents(
                 "invoice.xlsx",
                 "product.xlsx",
@@ -188,23 +320,129 @@ class StockFlowBehaviorTests(unittest.TestCase):
             )
 
         self.assertTrue(generator.prepare_called)
+        output_dir = "/tmp/out/INV-002 报关资料"
         self.assertEqual(generator.template_output_dir, "/tmp/out")
         self.assertEqual(generator.template_output_path, "/tmp/out/decl.xlsx")
         self.assertEqual(
             generator.page_view_paths,
             [
-                "/tmp/out/INV-002 报关资料.xlsx",
-                "/tmp/out/INV-002 发票合同.xlsx",
+                f"{output_dir}/INV-002 报关资料.xlsx",
             ],
+        )
+        export_workbook_to_pdf.assert_called_once_with(
+            f"{output_dir}/INV-002 报关资料.xlsx", f"{output_dir}/INV-002 报关资料.pdf"
+        )
+        export_worksheet_to_pdf.assert_called_once_with(
+            f"{output_dir}/INV-002 报关资料.xlsx", "合同", f"{output_dir}/INV-002 销售合同.pdf"
         )
         self.assertEqual(len(generator.call_records), 1)
         self.assertTrue(generator.call_records[0]["success"])
         self.assertEqual(render_detailed_list.call_count, 1)
         self.assertEqual(render_packing_list.call_count, 1)
-        self.assertEqual(render_bill.call_count, 2)
-        self.assertEqual(render_contract.call_count, 2)
+        self.assertEqual(render_bill.call_count, 1)
+        self.assertEqual(render_contract.call_count, 1)
         self.assertEqual(render_customs_declaration.call_count, 1)
         self.assertEqual(render_elements_sheet.call_count, 1)
+
+
+class StockCustomsDeclarationSheetTests(unittest.TestCase):
+    def test_awd_customs_declaration_mode_includes_invoice_number(self):
+        generator = CustomsDeclaration()
+        generator.shipping_details = {
+            "domestic_shipper": "杭州素桐电子商务有限公司91330106MA2KC3T74A",
+            "production_sales_unit": "杭州素桐电子商务有限公司91330106MA2KC3T74A",
+            "invoice_number": "26YP065",
+            "country_zh": "美国",
+            "TOTAL_PACKED_IN": 1,
+            "TOTAL_G.W": 2.5,
+            "TOTAL_N.W": 2.0,
+            "freight": 12.3,
+            "domestic_source_of_goods": "33019 杭州其他",
+            "images": ["image0", "image1"],
+            "is_awd": True,
+            "recipient": "Amazon.com Services, Inc.",
+        }
+        generator.result_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "SKU-1",
+                    "报关中文品名": "品名1",
+                    "是否含金刚石": False,
+                    "商品编号": "1234567890",
+                    "数量及单位": "1PCS",
+                    "箱数": "1",
+                    "预留1": "",
+                    "预留2": "",
+                    "单价": 10.5,
+                    "总价": 10.5,
+                }
+            ]
+        )
+
+        wb = Workbook()
+
+        with patch.object(generator, "add_images"):
+            generator.add_customs_declaration_sheet("unused.xlsx", "/tmp", wb=wb)
+
+        ws = wb["报关单"]
+        cell_value = ws["E8"].value
+
+        self.assertEqual(str(cell_value), "9710(26YP065)")
+        self.assertEqual(ws["A6"].value, "Amazon.com Services, Inc.")
+
+    def test_non_awd_customs_declaration_mode_also_includes_invoice_number(self):
+        generator = CustomsDeclaration()
+        generator.shipping_details = {
+            "domestic_shipper": "杭州易达工具有限公司3301965G22",
+            "production_sales_unit": "杭州易达工具有限公司91330108092054785Y",
+            "invoice_number": "INV-002",
+            "country_zh": "美国",
+            "TOTAL_PACKED_IN": 1,
+            "TOTAL_G.W": 2.5,
+            "TOTAL_N.W": 2.0,
+            "freight": 12.3,
+            "domestic_source_of_goods": "33019 杭州其他",
+            "images": ["image0", "image1"],
+            "is_awd": False,
+            "recipient": "Fulfilled by Tiktok",
+        }
+        generator.result_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "SKU-1",
+                    "报关中文品名": "品名1",
+                    "是否含金刚石": False,
+                    "商品编号": "1234567890",
+                    "数量及单位": "1PCS",
+                    "箱数": "1",
+                    "预留1": "",
+                    "预留2": "",
+                    "单价": 10.5,
+                    "总价": 10.5,
+                }
+            ]
+        )
+
+        wb = Workbook()
+
+        with patch.object(generator, "add_images"):
+            generator.add_customs_declaration_sheet("unused.xlsx", "/tmp", wb=wb)
+
+        ws = wb["报关单"]
+        self.assertEqual(str(ws["E8"].value), "9710(INV-002)")
+        self.assertEqual(ws["A6"].value, "Fulfilled by Tiktok")
+
+
+class StockLumiyaCompanyInfoTests(unittest.TestCase):
+    def test_lumiya_company_info_uses_updated_address(self):
+        generator = CustomsDeclaration()
+        lumiya_info = generator.company_info[1]
+
+        self.assertEqual(lumiya_info["company_name_en"], "Hangzhou Lumiya Technology Co., Ltd.")
+        self.assertTrue(lumiya_info["consignor"].startswith("Hangzhou Lumiya Technology Co., Ltd.\n"))
+        self.assertIn("BENEFICIARY NAME: Hangzhou Lumiya Technology Co., Ltd.", lumiya_info["bank_informations"])
+        self.assertIn("Add: Rm W318-2, Fl.3, Unit 5, Bld. 10 Area E, Aicheng Str.1#, Wuchang Street, Yuhang District, Hangzhou, Zhejiang, 311121, CN", lumiya_info["consignor"])
+        self.assertIn("ADDRESS: Rm W318-2, Fl.3, Unit 5, Bld. 10 Area E, Aicheng Str.1#, Wuchang Street, Yuhang District, Hangzhou, Zhejiang, 311121, CN", lumiya_info["bank_informations"])
 
 
 class StockRegisterTargetSelectionTests(unittest.TestCase):
@@ -317,7 +555,7 @@ class StockRegisterTargetSelectionTests(unittest.TestCase):
 
         with patch.object(generator, "register_combined_invoice", return_value=register_invoice_df), \
                 patch.object(generator, "_read_excel_cached", return_value=product_name_df):
-            _register_df, register_filepath, _sheet_name, _brand = generator.build_invoicing_register_df(
+            register_df, register_filepath, _sheet_name, _brand = generator.build_invoicing_register_df(
                 "invoice.xlsx",
                 "product.xlsx",
                 "lumiya.xlsx",
@@ -328,6 +566,10 @@ class StockRegisterTargetSelectionTests(unittest.TestCase):
             )
 
         self.assertEqual(register_filepath, "easycan.xlsx")
+        self.assertEqual(register_df.loc[0, "报关渠道"], "海外仓")
+        self.assertEqual(register_df.loc[0, "报关方式（9710/一般贸易）"], 9710)
+        self.assertEqual(register_df.loc[0, "成交方式(FOB/CIF/CFR)"], "CFR")
+        self.assertEqual(register_df.loc[0, "币别"], "USD")
 
 
 if __name__ == "__main__":

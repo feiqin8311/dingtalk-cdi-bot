@@ -4,11 +4,6 @@ import pandas as pd
 def select_declared_price_columns(declared_unit_price_df: pd.DataFrame, sheet_key: str,
                                   company_info_index: int, is_awd: bool,
                                   document_type: str = "stock") -> pd.DataFrame:
-    if document_type == "stock" and company_info_index == 0 and not is_awd:
-        result = declared_unit_price_df[["*SKU", "易达-欣耀\n申报单价（CNY）"]].copy()
-        result.rename(columns={"易达-欣耀\n申报单价（CNY）": "申报单价"}, inplace=True)
-        return result
-
     if sheet_key == "易达报关单价":
         price_col = next(
             (col for col in declared_unit_price_df.columns if "易达-亚马逊" in str(col) and "申报单价" in str(col)),

@@ -311,11 +311,11 @@ class QTInterface(QMainWindow):
         # 登记设置相关文件路径
         self.invoice_number_register_filepath = r"\\192.168.0.45\供应链管理\2 物流发货管理\2026出运明细.xlsx"
         self.register_folder_path = r"\\192.168.0.45\供应链管理\2 物流发货管理\1 报关开票登记"
-        self.lumiya_register_filepath = os.path.join(self.register_folder_path, "2025.9-鲁米亚报关明细.xlsx")
-        self.easycan_register_filepath = os.path.join(self.register_folder_path, "2025.9-易达报关明细 修复.xlsx")
-        self.sutong_register_filepath = os.path.join(self.register_folder_path, "2025-素桐报关开票明细.xlsx")
-        self.liulang_register_filepath = os.path.join(self.register_folder_path, "2025-六浪报关明细.xlsx")
-        self.jiangsheng_register_filepath = os.path.join(self.register_folder_path, "2025-匠晟报关明细.xlsx")
+        self.lumiya_register_filepath = os.path.join(self.register_folder_path, "2.鲁米亚报关明细.xlsx")
+        self.easycan_register_filepath = os.path.join(self.register_folder_path, "1.易达报关明细.xlsx")
+        self.sutong_register_filepath = os.path.join(self.register_folder_path, "5.素桐报关明细.xlsx")
+        self.liulang_register_filepath = os.path.join(self.register_folder_path, "3.六浪报关明细.xlsx")
+        self.jiangsheng_register_filepath = os.path.join(self.register_folder_path, "4.匠晟报关明细.xlsx")
 
     def setup_styles(self):
         """设置应用样式"""

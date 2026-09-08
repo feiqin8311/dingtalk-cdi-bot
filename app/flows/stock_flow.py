@@ -3,6 +3,7 @@ import os
 
 import openpyxl
 
+from app.core.pdf_export import export_workbook_to_pdf, export_worksheet_to_pdf
 from app.renderers.bill import render_bill
 from app.renderers.common import ensure_default_sheet_removed, finalize_workbook_page_setup
 from app.renderers.contract import render_contract
@@ -41,7 +42,11 @@ class StockFlow:
             )
             self._log_timed_step(generator, "准备报关数据", step_started_at)
 
-            output_dir = output_filepath
+            declaration_output_dir = output_filepath
+            output_dir = os.path.join(
+                declaration_output_dir, f"{generator.shipping_details['invoice_number']} 报关资料"
+            )
+            os.makedirs(output_dir, exist_ok=True)
             output_filepath = os.path.join(
                 output_dir, f"{generator.shipping_details['invoice_number']} 报关资料.xlsx"
             )
@@ -62,44 +67,31 @@ class StockFlow:
 
             if generate_declaration_file:
                 step_started_at = datetime.datetime.now()
-                declaration_template_path = generator.copy_declaration_template_file(output_dir)
+                declaration_template_path = generator.copy_declaration_template_file(declaration_output_dir)
                 generator.fill_declaration_template_file(declaration_template_path)
                 self._log_timed_step(generator, "填充申报模板", step_started_at)
             else:
                 generator.log_message("申报文件开关为否，跳过申报模板复制与填充")
 
-            invoice_contract_path = os.path.join(
-                output_dir, f"{generator.shipping_details['invoice_number']} 发票合同.xlsx"
-            )
-            generator.log_message(f"发票合同输出文件: {invoice_contract_path}")
-            step_started_at = datetime.datetime.now()
-            wb_contract = openpyxl.Workbook()
-            render_bill(
-                generator,
-                invoice_contract_path,
-                pictures_path,
-                wb=wb_contract,
-                use_base_price=True,
-                add_freight_row=True,
-                sheet_title="发票",
-            )
-            ensure_default_sheet_removed(wb_contract)
-            render_contract(
-                generator,
-                invoice_contract_path,
-                pictures_path,
-                wb=wb_contract,
-                use_base_price=True,
-                add_freight_row=True,
-            )
-            finalize_workbook_page_setup(wb_contract)
-            wb_contract.save(invoice_contract_path)
-            self._log_timed_step(generator, "渲染发票合同工作簿", step_started_at)
-
             step_started_at = datetime.datetime.now()
             generator.set_excel_page_view(output_filepath)
-            generator.set_excel_page_view(invoice_contract_path)
             self._log_timed_step(generator, "设置分页视图", step_started_at)
+
+            report_pdf_path = os.path.join(
+                output_dir, f"{generator.shipping_details['invoice_number']} 报关资料.pdf"
+            )
+            step_started_at = datetime.datetime.now()
+            export_workbook_to_pdf(output_filepath, report_pdf_path)
+            self._log_timed_step(generator, "导出报关资料 PDF", step_started_at)
+            generator.log_message(f"报关资料 PDF 输出文件: {report_pdf_path}")
+
+            contract_pdf_path = os.path.join(
+                output_dir, f"{generator.shipping_details['invoice_number']} 销售合同.pdf"
+            )
+            step_started_at = datetime.datetime.now()
+            export_worksheet_to_pdf(output_filepath, "合同", contract_pdf_path)
+            self._log_timed_step(generator, "导出销售合同 PDF", step_started_at)
+            generator.log_message(f"销售合同 PDF 输出文件: {contract_pdf_path}")
             generator.log_message("报关资料生成完成(备货单)")
             generator.append_call_record(
                 module_name="备货单",
