@@ -69,6 +69,29 @@ _WAREHOUSE_RECIPIENT_MAP = (
     ("仓盛美中仓", "ShipSage\n460 Gibraltar Drive, Bolingbrook IL 60440, US"),
     ("海盟-新泽西", "GCE Logistics East Inc.\n545 Monmouth Rd, Jackson Township, NJ 08527"),
 )
+_COUNTRY_NAME_ALIASES = {
+    "US": "美国",
+    "USA": "美国",
+    "UNITED STATES": "美国",
+    "UNITED STATES OF AMERICA": "美国",
+    "AMERICA": "美国",
+    "JP": "日本",
+    "JAPAN": "日本",
+    "CA": "加拿大",
+    "CANADA": "加拿大",
+    "UK": "英国",
+    "GB": "英国",
+    "UNITED KINGDOM": "英国",
+    "BRITAIN": "英国",
+    "DE": "德国",
+    "GERMANY": "德国",
+    "AU": "澳洲",
+    "AUS": "澳洲",
+    "AUSTRALIA": "澳洲",
+    "AE": "阿联酋",
+    "UAE": "阿联酋",
+    "UNITED ARAB EMIRATES": "阿联酋",
+}
 _FONT_CACHE = {}
 _ALIGNMENT_CACHE = {}
 _FONT_CLS = Font
@@ -467,6 +490,16 @@ class CustomsDeclaration:
                 .str.replace(r'^AE', '', regex=True, case=False))
 
     @staticmethod
+    def normalize_country_name(value) -> str:
+        """将备货单导出的国家缩写统一成下游使用的中文国家名"""
+        if pd.isna(value):
+            return ""
+        country = str(value).strip()
+        if country == "":
+            return ""
+        return _COUNTRY_NAME_ALIASES.get(country.upper(), country)
+
+    @staticmethod
     def resolve_warehouse_recipient(warehouse_series: pd.Series) -> str:
         """根据收货仓库关键词匹配收件人"""
         warehouses = warehouse_series.dropna().astype(str)
@@ -643,9 +676,7 @@ class CustomsDeclaration:
         self.shipping_details['is_awd'] = is_awd
         self.shipping_details['recipient'] = self.resolve_warehouse_recipient(warehouse_series)
 
-        # 目的国固定美国，目的港不填
-        self.shipping_details['country_zh'] = "美国"
-        self.shipping_details['country'] = "USA"
+        # 目的港不填；目的国稍后从装箱信息的“国家”列读取
         self.shipping_details['Logistics_center'] = ""
 
         # 唛头默认
@@ -683,6 +714,21 @@ class CustomsDeclaration:
             invoice_df['SKU'] = invoice_df['SKU'].astype(str)
         invoice_df['SKU'] = self.normalize_stock_sku(invoice_df['SKU'])
         invoice_df['SKU'] = self.normalize_stock_sku(invoice_df['SKU'])
+        invoice_df['国家'] = invoice_df['国家'].apply(self.normalize_country_name)
+
+        country_values = invoice_df['国家'].dropna().astype(str).str.strip()
+        country_values = country_values[country_values != '']
+        if country_values.empty:
+            raise ValueError("备货单装箱信息的国家为空，无法生成报关资料")
+        country_list = country_values.drop_duplicates().tolist()
+        if len(country_list) > 1:
+            raise ValueError(f"备货单装箱信息存在多个国家：{country_list}，请拆分后生成报关资料")
+        country_zh = country_list[0]
+        if country_zh not in self.country_code:
+            raise ValueError(f"备货单装箱信息国家未维护编码：{country_zh}")
+        self.shipping_details['country_zh'] = country_zh
+        self.shipping_details['country'] = self.country_code[country_zh]
+
         if '总体积（m³）-箱子' in invoice_df.columns:
             volume_series = pd.to_numeric(invoice_df['总体积（m³）-箱子'], errors='coerce')
             invoice_df['总体积（m³）-箱子'] = volume_series.astype(float)
@@ -2508,13 +2554,25 @@ class CustomsDeclaration:
         declaration_df['报送时间'] = report_time
         declaration_df['报送类型'] = '1'
         declaration_df['报送状态'] = '2'
-        declaration_df['订单类型'] = 'B'
+        declaration_df['订单类型'] = 'W' if brand == 'SIXPRAY' else 'B'
         declaration_df['电商平台代码'] = platform_code
         declaration_df['电商平台名称'] = platform_name
         declaration_df['商品金额'] = self.shipping_details.get('TOTAL_PRICE', 0)
         declaration_df['运杂费'] = self.shipping_details.get('freight', 0)
         declaration_df['币制'] = '502'
         declaration_df['明细币制'] = '502'
+
+        use_recalculated_unit_price = len(declaration_df) == 1
+        if use_recalculated_unit_price:
+            declaration_df['申报单价'] = pd.to_numeric(declaration_df['申报单价'], errors='coerce').astype(float)
+            quantity = pd.to_numeric(declaration_df.iloc[0][quantity_col], errors='coerce')
+            total_price = pd.to_numeric(declaration_df.iloc[0]['总价'], errors='coerce')
+            if pd.isna(quantity) or quantity == 0:
+                raise ValueError("申报模板填充失败：单产品申报单价重算时数量为空或为0")
+            if pd.isna(total_price):
+                raise ValueError("申报模板填充失败：单产品申报单价重算时总价为空")
+            declaration_df.loc[declaration_df.index[0], '申报单价'] = round(total_price / quantity, 4)
+
         wb = load_workbook(template_output_path)
         ws = wb.worksheets[0]
         data_start_row = 4
@@ -2565,7 +2623,9 @@ class CustomsDeclaration:
             o_cell.number_format = '@'
             ws.cell(row=excel_row, column=16, value=row['明细币制'])           # P
             ws.cell(row=excel_row, column=17, value=row[quantity_col])        # Q
-            ws.cell(row=excel_row, column=18, value=row['申报单价'])           # R
+            r_cell = ws.cell(row=excel_row, column=18, value=row['申报单价'])  # R
+            if use_recalculated_unit_price:
+                r_cell.number_format = '0.0000'
             ws.cell(row=excel_row, column=19, value=row['总价'])              # S
             for col_idx in range(1, 20):
                 ws.cell(row=excel_row, column=col_idx).alignment = center_alignment
@@ -2635,6 +2695,7 @@ class CustomsDeclaration:
         if invoice_df['SKU'].dtype != object:
             invoice_df['SKU'] = invoice_df['SKU'].astype(str)
         invoice_df['SKU'] = self.normalize_stock_sku(invoice_df['SKU'])
+        invoice_df['国家'] = invoice_df['国家'].apply(self.normalize_country_name)
         invoice_df = invoice_df[required_invoice_cols]
 
         # 读取备货单详情
@@ -2762,7 +2823,8 @@ class CustomsDeclaration:
         result_df = self.register_combined_invoice(invoice_filepath, product_filepath)
         result_df['发票号'] = invoice_number
         result_df['收货仓库'] = result_df['收货仓库'].fillna('').astype(str).str.strip()
-        result_df['国家'] = "美国"
+        fallback_country = self.shipping_details.get('country_zh', "美国")
+        result_df['国家'] = result_df['国家'].replace('', np.nan).fillna(fallback_country)
         if tracking_df is None:
             tracking_df = self._read_excel_cached(
                 invoice_filepath, sheet_name=self.tracking_sheet_name, usecols=_STOCK_TRACKING_COLS
@@ -2941,7 +3003,7 @@ class CustomsDeclaration:
             invoice_df = self.update_shipment_quantity(invoice_df)
 
         customs_declaration_channels = "海外仓"
-        customs_declaration_method = 9710
+        customs_declaration_method = 9810 if self.company_info_index == 3 else 9710
 
         if not self.shipping_details.get('invoice_number'):
             tracking_df = self._read_excel_cached(

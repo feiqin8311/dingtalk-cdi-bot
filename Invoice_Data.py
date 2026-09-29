@@ -1972,7 +1972,12 @@ class CustomsDeclaration:
             self.control_info = '不属于管制物项'
 
         invoice_number = str(self.shipping_details.get('invoice_number', '')).strip()
-        customs_mode_text = f"9710({invoice_number})" if invoice_number else "9710"
+        is_liulang = (
+            self.company_info_index == 3
+            or str(self.shipping_details.get('brand', '')).strip().upper() == "SIXPRAY"
+        )
+        customs_mode_code = "9810" if is_liulang else "9710"
+        customs_mode_text = f"{customs_mode_code}({invoice_number})" if invoice_number else customs_mode_code
 
         # 填充数据
         excel_data = [
@@ -2357,13 +2362,25 @@ class CustomsDeclaration:
         declaration_df['报送时间'] = report_time
         declaration_df['报送类型'] = '1'
         declaration_df['报送状态'] = '2'
-        declaration_df['订单类型'] = 'B'
+        declaration_df['订单类型'] = 'W' if brand == 'SIXPRAY' else 'B'
         declaration_df['电商平台代码'] = platform_code
         declaration_df['电商平台名称'] = platform_name
         declaration_df['商品金额'] = self.shipping_details.get('TOTAL_PRICE', 0)
         declaration_df['运杂费'] = self.shipping_details.get('freight', 0)
         declaration_df['币制'] = '502'
         declaration_df['明细币制'] = '502'
+
+        use_recalculated_unit_price = len(declaration_df) == 1
+        if use_recalculated_unit_price:
+            declaration_df['申报单价'] = pd.to_numeric(declaration_df['申报单价'], errors='coerce').astype(float)
+            quantity = pd.to_numeric(declaration_df.iloc[0]['发货数量'], errors='coerce')
+            total_price = pd.to_numeric(declaration_df.iloc[0]['总价'], errors='coerce')
+            if pd.isna(quantity) or quantity == 0:
+                raise ValueError("申报模板填充失败：单产品申报单价重算时数量为空或为0")
+            if pd.isna(total_price):
+                raise ValueError("申报模板填充失败：单产品申报单价重算时总价为空")
+            declaration_df.loc[declaration_df.index[0], '申报单价'] = round(total_price / quantity, 4)
+
         wb = load_workbook(template_output_path)
         ws = wb.worksheets[0]
         data_start_row = 4
@@ -2414,7 +2431,9 @@ class CustomsDeclaration:
             o_cell.number_format = '@'
             ws.cell(row=excel_row, column=16, value=row['明细币制'])          # P
             ws.cell(row=excel_row, column=17, value=row['发货数量'])         # Q
-            ws.cell(row=excel_row, column=18, value=row['申报单价'])          # R
+            r_cell = ws.cell(row=excel_row, column=18, value=row['申报单价'])  # R
+            if use_recalculated_unit_price:
+                r_cell.number_format = '0.0000'
             ws.cell(row=excel_row, column=19, value=row['总价'])             # S
             for col_idx in range(1, 20):
                 ws.cell(row=excel_row, column=col_idx).alignment = center_alignment
@@ -2692,7 +2711,7 @@ class CustomsDeclaration:
 
         # 设置默认值,报关渠道、报关方式、成交方式、供应商名称、币别
         customs_declaration_channels = "亚马逊"
-        customs_declaration_method = 9710
+        customs_declaration_method = 9810 if self.company_info_index == 3 else 9710
         transaction_method = "CFR"
         supplier_name = "上海友谊卷笔刀有限公司"
         currency = "USD"

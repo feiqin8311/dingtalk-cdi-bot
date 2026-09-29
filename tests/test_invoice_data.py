@@ -518,6 +518,138 @@ class InvoiceCustomsDeclarationSheetTests(unittest.TestCase):
 
         self.assertEqual(str(cell_value), "9710(26YP065)")
 
+    def test_liulang_customs_declaration_mode_uses_9810(self):
+        generator = CustomsDeclaration()
+        generator.company_info_index = 3
+        generator.shipping_details = {
+            "domestic_shipper": "杭州六浪电子商务有限公司3301969GM3",
+            "production_sales_unit": "杭州六浪电子商务有限公司91330106MA2KC5AM13",
+            "invoice_number": "26EBA42",
+            "country_zh": "英国",
+            "TOTAL_PACKED_IN": 1,
+            "TOTAL_G.W": 2.5,
+            "TOTAL_N.W": 2.0,
+            "freight": 12.3,
+            "domestic_source_of_goods": "33019 杭州其他",
+            "images": ["image0", "image1"],
+            "brand": "SIXPRAY",
+        }
+        generator.result_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "SKU-1",
+                    "报关中文品名": "品名1",
+                    "是否含金刚石": False,
+                    "商品编号": "1234567890",
+                    "数量及单位": "1PCS",
+                    "箱数": "1",
+                    "预留1": "",
+                    "预留2": "",
+                    "单价": 10.5,
+                    "总价": 10.5,
+                }
+            ]
+        )
+
+        wb = Workbook()
+
+        with patch.object(generator, "add_images"):
+            generator.add_customs_declaration_sheet("unused.xlsx", "/tmp", wb=wb)
+
+        self.assertEqual(str(wb["报关单"]["E8"].value), "9810(26EBA42)")
+
+
+class InvoiceDeclarationTemplateTests(unittest.TestCase):
+    def test_declaration_template_order_type_is_w(self):
+        generator = CustomsDeclaration()
+        generator.shipping_details = {
+            "brand": "SIXPRAY",
+            "invoice_number": "26EBA42",
+            "TOTAL_PRICE": 10,
+            "freight": 1.2,
+        }
+        generator.result_df = pd.DataFrame(
+            [
+                {
+                    "HS CODE": "8203200000",
+                    "报关中文品名": "测试品名",
+                    "单位": "个",
+                    "发货数量": 3,
+                    "申报单价": 99,
+                    "总价": 10,
+                }
+            ]
+        )
+
+        wb = Workbook()
+        wb.active.title = "申报模板"
+        unit_ws = wb.create_sheet("计量单位代码")
+        unit_ws.append([])
+        unit_ws.append(["计量单位代码", "计量单位名称"])
+        unit_ws.append(["007", "个"])
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            template_path = tmp.name
+        try:
+            wb.save(template_path)
+
+            generator.fill_declaration_template_file(template_path)
+
+            result_wb = load_workbook(template_path)
+            try:
+                self.assertEqual(result_wb.worksheets[0]["D4"].value, "W")
+                self.assertAlmostEqual(result_wb.worksheets[0]["R4"].value, 3.3333)
+                self.assertEqual(result_wb.worksheets[0]["R4"].number_format, "0.0000")
+            finally:
+                result_wb.close()
+        finally:
+            os.remove(template_path)
+
+    def test_non_liulang_declaration_template_order_type_stays_b(self):
+        generator = CustomsDeclaration()
+        generator.shipping_details = {
+            "brand": "EZARC",
+            "invoice_number": "26EA001",
+            "TOTAL_PRICE": 10,
+            "freight": 1.2,
+        }
+        generator.result_df = pd.DataFrame(
+            [
+                {
+                    "HS CODE": "8203200000",
+                    "报关中文品名": "测试品名",
+                    "单位": "个",
+                    "发货数量": 4,
+                    "申报单价": 99,
+                    "总价": 10,
+                }
+            ]
+        )
+
+        wb = Workbook()
+        wb.active.title = "申报模板"
+        unit_ws = wb.create_sheet("计量单位代码")
+        unit_ws.append([])
+        unit_ws.append(["计量单位代码", "计量单位名称"])
+        unit_ws.append(["007", "个"])
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            template_path = tmp.name
+        try:
+            wb.save(template_path)
+
+            generator.fill_declaration_template_file(template_path)
+
+            result_wb = load_workbook(template_path)
+            try:
+                self.assertEqual(result_wb.worksheets[0]["D4"].value, "B")
+                self.assertEqual(result_wb.worksheets[0]["R4"].value, 2.5)
+                self.assertEqual(result_wb.worksheets[0]["R4"].number_format, "0.0000")
+            finally:
+                result_wb.close()
+        finally:
+            os.remove(template_path)
+
 
 class InvoiceLumiyaCompanyInfoTests(unittest.TestCase):
     def test_consolidate_lcl_shipping_rows_counts_shared_cartons_once(self):
@@ -717,6 +849,63 @@ class InvoiceLumiyaCompanyInfoTests(unittest.TestCase):
             )
 
         self.assertEqual(register_filepath, "jiangsheng.xlsx")
+
+    def test_liulang_invoicing_register_uses_9810(self):
+        generator = CustomsDeclaration()
+        generator.company_info_index = 3
+        generator.lcl_flag = False
+        generator.shipping_details = {
+            "currency": "USD",
+            "invoice_number": "26EBA42",
+            "transportation_method": "海派",
+            "logistics_provider": "物流商A",
+            "country_zh": "英国",
+        }
+        generator.result_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "SKU-1",
+                    "报关中文品名": "品名1",
+                    "英文品名": "Name1",
+                    "HS CODE": "HS1",
+                    "发货数量": 1,
+                    "单位": "PCS",
+                    "申报单价": 10,
+                    "总价": 10,
+                }
+            ]
+        )
+
+        invoice_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "SKU-1",
+                    "店铺": "SIXPRAY",
+                    "发货单号": "SHIP-001",
+                    "发货数量": 1,
+                    "物流商单号": "26EBA42",
+                }
+            ]
+        )
+        product_name_df = pd.DataFrame(
+            [{"*SKU": "SKU-1", "报关中文品名": "品名1"}]
+        )
+
+        with patch.object(generator, "register_combined_invoice", return_value=invoice_df), \
+                patch.object(generator, "_read_excel_cached", return_value=product_name_df):
+            register_df, register_filepath, sheet_name, _brand, _original_rows = generator.build_invoicing_register_df(
+                "invoice.xlsx",
+                "product.xlsx",
+                "lumiya.xlsx",
+                "easycan.xlsx",
+                "sutong.xlsx",
+                "liulang.xlsx",
+                "jiangsheng.xlsx",
+            )
+
+        self.assertEqual(register_filepath, "liulang.xlsx")
+        self.assertEqual(sheet_name, "2026（内部开票）")
+        self.assertEqual(register_df.loc[0, "报关方式（9710/一般贸易）"], 9810)
 
     def test_register_combined_invoice_does_not_expand_rows_for_duplicate_detail_keys(self):
         generator = CustomsDeclaration()
