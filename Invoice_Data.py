@@ -32,6 +32,12 @@ from app.core.text_layout import calculate_wrapped_text_height
 from app.services.declared_price_service import select_declared_price_columns
 from app.services.elements_service import find_data_group as shared_find_data_group
 from app.services.freight_service import calculate_shipping_costs as shared_calculate_shipping_costs
+from app.services.lumiya_source_service import apply_lumiya_source_columns
+from app.services.lumiya_source_service import attach_lumiya_register_source
+from app.services.lumiya_source_service import build_lumiya_external_declaration_register
+from app.services.lumiya_source_service import build_lumiya_internal_declaration_register
+from app.services.lumiya_source_service import split_lumiya_register_entries
+from app.services.lumiya_source_service import update_dominant_source_display
 from app.renderers.common import ensure_default_sheet_removed, finalize_workbook_page_setup
 from app.renderers.detailed_list import render_detailed_list
 from app.renderers.packing_list import render_packing_list
@@ -48,14 +54,29 @@ _NO_SIDE = Side(style='none')
 _THIN_BORDER = Border(left=_THIN_SIDE, right=_THIN_SIDE, top=_THIN_SIDE, bottom=_THIN_SIDE)
 _NO_BORDER = Border(left=_NO_SIDE, right=_NO_SIDE, top=_NO_SIDE, bottom=_NO_SIDE)
 _PRODUCT_INFO_COLS = [
-    '*SKU', '报关中文品名', '单品毛重(g)', '外箱规格长(cm)', '外箱规格宽(cm)', '外箱规格高(cm)',
-    '单箱数量(pcs)', '材质', '货源地', '供应商名称', '报关用采购成本(CNY)'
+    '*SKU', '*品名', '报关中文品名', '单品毛重(g)', '外箱规格长(cm)', '外箱规格宽(cm)', '外箱规格高(cm)',
+    '单箱数量(pcs)', '材质', '货源地', '供应商名称', '采购员', '报关用采购成本(CNY)'
 ]
 _INVOICE_DETAILS_COLS = ['SKU', '物流中心编码', '运输方式', '物流商单号', '店铺', '物流商']
 _FONT_CACHE = {}
 _ALIGNMENT_CACHE = {}
 _FONT_CLS = Font
 _ALIGNMENT_CLS = Alignment
+
+
+def _is_product_info_col(column: str) -> bool:
+    return column in _PRODUCT_INFO_COLS
+
+
+def _normalize_product_declaration_names(product_df: pd.DataFrame) -> pd.DataFrame:
+    result = product_df.copy()
+    if '*品名' not in result.columns or '报关中文品名' not in result.columns:
+        return result
+    source_name = result['*品名'].fillna('').astype(str)
+    declaration_name = result['报关中文品名'].fillna('').astype(str)
+    nut_adapter_mask = declaration_name.eq('铆钉枪转换接头') & source_name.str.contains('螺母枪转换', na=False)
+    result.loc[nut_adapter_mask, '报关中文品名'] = '螺母枪转换接头'
+    return result
 
 # 日志文件路径（打包时落在可执行文件所在目录）
 def _get_log_dir() -> str:
@@ -515,9 +536,9 @@ class CustomsDeclaration:
         ws.add_image(img, cell_location)
 
     @staticmethod
-    def apply_persistent_page_setup(ws) -> None:
+    def apply_persistent_page_setup(ws, fit_to_height: int | None = None) -> None:
         """将分页预览和单页缩放设置持久化写入工作表"""
-        core_apply_persistent_page_setup(ws)
+        core_apply_persistent_page_setup(ws, fit_to_height=fit_to_height)
 
     @classmethod
     def set_excel_page_view(cls, file_path: str) -> None:
@@ -656,10 +677,11 @@ class CustomsDeclaration:
 
         # 读取产品信息单证专用
         product_df = self._read_excel_cached(
-            product_filepath, sheet_name=self.product_sheet_name, usecols=_PRODUCT_INFO_COLS
+            product_filepath, sheet_name=self.product_sheet_name, usecols=_is_product_info_col
         )
         # 将*SKU转为字符串
         product_df['*SKU'] = product_df['*SKU'].astype(str)
+        product_df = _normalize_product_declaration_names(product_df)
 
         return invoice_df, invoice_details_df, product_df
 
@@ -792,9 +814,12 @@ class CustomsDeclaration:
         # 如果同一个发货单号里面，如果有重复的SKU，就重新计算发货数量，发货数量 = 箱数 * 单箱数量，否则就不处理
         invoice_df = self.update_shipment_quantity(invoice_df)
 
+        for optional_col in ['供应商名称', '采购员']:
+            if optional_col not in product_df.columns:
+                product_df[optional_col] = ''
         product_df = product_df[
             ['*SKU', '报关中文品名', '单品毛重(g)', '外箱规格长(cm)', '外箱规格宽(cm)', '外箱规格高(cm)',
-             '单箱数量(pcs)', '材质']]
+             '单箱数量(pcs)', '材质', '供应商名称', '采购员']]
         # 转换单品毛重(g)
         product_df['单品毛重(g)'] = product_df['单品毛重(g)'].astype(float) / 1000
         # 重命名列
@@ -806,6 +831,9 @@ class CustomsDeclaration:
 
         # 删除'*SKU'列
         merge_df.drop(columns=['*SKU'], inplace=True)
+        merge_df = apply_lumiya_source_columns(
+            merge_df, self.company_info_index, self.shipping_details['domestic_source_of_goods']
+        )
 
         # 外箱规格长(cm) * 外箱规格宽(cm) * 外箱规格高(cm) / 单箱数量(pcs) * 发货数量  / 1000000
         merge_df['总体积'] = merge_df['外箱规格长(cm)'] * merge_df['外箱规格宽(cm)'] * merge_df[
@@ -831,8 +859,10 @@ class CustomsDeclaration:
         # 新增是否含金刚石列
         merge_df['是否含金刚石'] = merge_df['材质'].str.contains('金刚石', na=False)
 
-        # 根据报关中文品名、是否含金刚石进行分组，汇总发货数量、总PCS、申报总价、总体积、箱数
-        sum_df = merge_df.groupby(['报关中文品名', '是否含金刚石']).agg({
+        declaration_group_cols = ['报关中文品名', '是否含金刚石', '境内货源地', '境内货源地显示']
+
+        # 根据报关中文品名、是否含金刚石、境内货源地进行分组，汇总发货数量、总PCS、申报总价、总体积、箱数
+        sum_df = merge_df.groupby(declaration_group_cols).agg({
             '发货数量': 'sum',
             '申报总价': 'sum',
             '总PCS': 'sum',
@@ -840,7 +870,9 @@ class CustomsDeclaration:
             '箱数': 'sum',
             'SKU': 'first',
             '箱子长度（cm）': 'first',
-            '箱子宽度（cm）': 'first'
+            '箱子宽度（cm）': 'first',
+            '供应商名称': 'first',
+            '采购员': 'first'
         }).reset_index()
 
         # 存储拼箱数据
@@ -848,7 +880,7 @@ class CustomsDeclaration:
         # 拼箱的品名
         groups_list = []
         for i, row in sum_df.iterrows():
-            name = (row['报关中文品名'], row['是否含金刚石'])
+            name = tuple(row[col] for col in declaration_group_cols)
             sum_dict[name] = {
                 'SKU': row['SKU'],
                 '发货数量': row['发货数量'],
@@ -858,6 +890,8 @@ class CustomsDeclaration:
                 '箱数': row['箱数'],
                 '箱子长度（cm）': row['箱子长度（cm）'],
                 '箱子宽度（cm）': row['箱子宽度（cm）'],
+                '供应商名称': row['供应商名称'],
+                '采购员': row['采购员'],
             }
 
         float_columns = ['箱子毛重（kg）', 'CBM（m³）-箱子', '总重量（kg）-箱子', '总体积（m³）-箱子']
@@ -894,8 +928,9 @@ class CustomsDeclaration:
                 lcl_total_boxes += group.iloc[0]['箱数']
 
                 # 存储拼箱的数据
-                groups_names = group["报关中文品名"].unique().tolist()
-                groups_list = list(set(groups_list + groups_names))
+                groups_list = list(
+                    set(groups_list + list(group[declaration_group_cols].drop_duplicates().itertuples(index=False, name=None)))
+                )
 
                 # 单品毛重汇总 = 单品毛重(kg) * 发货数量
                 group['单品毛重汇总'] = group['单品毛重(kg)'] * group['发货数量']
@@ -922,19 +957,19 @@ class CustomsDeclaration:
         merge_df['总重量（kg）-箱子'] = merge_df['箱子毛重（kg）'] * merge_df['箱数']
         merge_df['总体积（m³）-箱子'] = merge_df['CBM（m³）-箱子'] * merge_df['箱数']
 
-        # 根据报关中文品名、是否含金刚石进行分组，汇总总重量（kg）-箱子、总体积（m³）-箱子
+        # 根据报关中文品名、是否含金刚石、境内货源地进行分组，汇总总重量（kg）-箱子、总体积（m³）-箱子
         weight_df = (merge_df
-                     .groupby(['报关中文品名', '是否含金刚石'], as_index=False)[
+                     .groupby(declaration_group_cols, as_index=False)[
                          ['总重量（kg）-箱子', '总体积（m³）-箱子']]
                      .sum())
 
         # 存储报关品名数据
         for i, row in weight_df.iterrows():
-            name = (row['报关中文品名'], row['是否含金刚石'])
+            name = tuple(row[col] for col in declaration_group_cols)
             sum_dict[name]['总重量（kg）-箱子'] = row['总重量（kg）-箱子']
             sum_dict[name]['总体积（m³）-箱子'] = row['总体积（m³）-箱子']
             # 如果是拼箱数据，就 /15，否则不变
-            if row['报关中文品名'] in groups_list:
+            if name in groups_list:
                 sum_dict[name]['箱数'] = 1 if math.floor(row['总重量（kg）-箱子'] / 15.0) == 0 else math.floor(
                     row['总重量（kg）-箱子'] / 15.0)
             lcl_total_boxes -= sum_dict[name]['箱数']
@@ -944,18 +979,23 @@ class CustomsDeclaration:
         # 分配多余的箱数
         if lcl_total_boxes > 0:
             for key, value in sorted_data.items():
-                if key[0] in groups_list:
+                if key in groups_list:
                     value['箱数'] += lcl_total_boxes
                     break
         elif lcl_total_boxes < 0:
             for key, value in sorted_data.items():
-                if key[0] in groups_list:
+                if key in groups_list:
                     value['箱数'] += lcl_total_boxes
                     break
 
         # 转换为DataFrame
         result_df = pd.DataFrame.from_dict(sorted_data, orient='index').reset_index()
-        result_df = result_df.rename(columns={'level_0': '报关中文品名', 'level_1': '是否含金刚石'})
+        result_df = result_df.rename(columns={
+            'level_0': '报关中文品名',
+            'level_1': '是否含金刚石',
+            'level_2': '境内货源地',
+            'level_3': '境内货源地显示',
+        })
         result_df['实际总体积（m³）-箱子'] = (result_df['总体积'] / result_df['总体积'].sum() * result_df[
             '总体积（m³）-箱子'].sum() * 1.05)
         # 如果'实际总体积（m³）-箱子'小于0.01，就变成0.01
@@ -963,7 +1003,7 @@ class CustomsDeclaration:
 
         result_df = result_df[
             ['报关中文品名', 'SKU', '发货数量', '总PCS', '申报总价', '箱数', '总重量（kg）-箱子', '实际总体积（m³）-箱子',
-             '箱子长度（cm）', '箱子宽度（cm）', '是否含金刚石']]
+             '箱子长度（cm）', '箱子宽度（cm）', '是否含金刚石', '境内货源地', '境内货源地显示', '供应商名称', '采购员']]
 
         invalid_box_df = result_df[result_df['箱数'] <= 0].copy()
         if not invalid_box_df.empty:
@@ -980,8 +1020,6 @@ class CustomsDeclaration:
         # 重命名列
         result_df.rename(columns={'实际总体积（m³）-箱子': '总体积（m³）-箱子'}, inplace=True)
 
-        # 申报单价 = 申报总价 / 发货数量
-        result_df['申报单价'] = (result_df['申报总价'] / result_df['发货数量']).round(2)
         # 箱子毛重（kg） = 总重量（kg）-箱子 / 箱数
         result_df['箱子毛重（kg）'] = (result_df['总重量（kg）-箱子'] / result_df['箱数']).round(2)
 
@@ -1004,9 +1042,12 @@ class CustomsDeclaration:
             )
         allocation = base_series / base_total * self.shipping_details['freight']
         result_df['含运费申报单价'] = (
-                allocation / result_df['发货数量'] + result_df['申报单价']).round(2)
-        # 含运费申报总价 = 含运费申报单价 * 发货数量
-        result_df['含运费申报总价'] = result_df['含运费申报单价'] * result_df['发货数量']
+                (result_df['申报总价'] + allocation) / result_df['发货数量']
+        ).round(2)
+        # 总价必须使用保留两位后的含运费申报单价反算，并保留两位小数。
+        result_df['含运费申报总价'] = (
+                result_df['含运费申报单价'] * result_df['发货数量']
+        ).round(2)
         # 包装种类
         result_df['包装种类'] = '纸箱'
         # 每件净重KGS
@@ -1018,7 +1059,8 @@ class CustomsDeclaration:
         result_df = result_df[
             ['SKU', '报关中文品名', '发货数量', '箱数', '包装种类', '含运费申报单价', '含运费申报总价',
              '箱子毛重（kg）', '总重量（kg）-箱子', '每件净重KGS', '共重净重KGS', '箱子长度（cm）', '箱子宽度（cm）',
-             '箱子高度（cm）', '总体积（m³）-箱子', '总PCS', '是否含金刚石']]
+             '箱子高度（cm）', '总体积（m³）-箱子', '总PCS', '是否含金刚石',
+             '境内货源地', '境内货源地显示', '供应商名称', '采购员']]
 
         # 重命名列
         result_df.rename(columns={'含运费申报单价': '申报单价', '含运费申报总价': '总价', '箱子毛重（kg）': '每件毛重KGS',
@@ -1034,7 +1076,8 @@ class CustomsDeclaration:
         result_df = result_df[
             ['SKU', '报关中文品名', '英文品名', 'HS CODE', '发货数量', '单位', '箱数', '包装种类', '申报单价', '总价',
              '每件毛重KGS', '箱子总毛重（kg）', '每件净重KGS', '共重净重KGS', '箱子长度（cm）', '箱子宽度（cm）',
-             '箱子高度（cm）', '体积', '总PCS', '是否含金刚石']]
+             '箱子高度（cm）', '体积', '总PCS', '是否含金刚石',
+             '境内货源地', '境内货源地显示', '供应商名称', '采购员']]
 
         # 总发货数量
         self.shipping_details['TOTAL_QUANTITY'] = result_df['发货数量'].sum()
@@ -1048,6 +1091,7 @@ class CustomsDeclaration:
         self.shipping_details['TOTAL_MEAS'] = result_df['体积'].sum().round(2)
         # 总价
         self.shipping_details['TOTAL_PRICE'] = result_df['总价'].sum().round(2)
+        update_dominant_source_display(self.shipping_details, result_df)
 
         # 筛选发货单详情Sheet页的字段
         invoice_details_df = invoice_details_df[['SKU', '店铺']]
@@ -1117,8 +1161,11 @@ class CustomsDeclaration:
         # 将SKU转为字符串
         invoice_df['SKU'] = invoice_df['SKU'].astype(str)
 
+        for optional_col in ['供应商名称', '采购员']:
+            if optional_col not in product_df.columns:
+                product_df[optional_col] = ''
         product_df = product_df[
-            ['*SKU', '报关中文品名', '货源地', '供应商名称', '报关用采购成本(CNY)', '材质']]
+            ['*SKU', '报关中文品名', '货源地', '供应商名称', '采购员', '报关用采购成本(CNY)', '材质']]
 
         # 读取品名表
         name_df = self._get_product_name_df(product_name_filepath)
@@ -1137,6 +1184,9 @@ class CustomsDeclaration:
         self.check_data(merge_df, "check_sku")
         # 删除'*SKU'列
         merge_df.drop(columns=['*SKU'], inplace=True)
+        merge_df = apply_lumiya_source_columns(
+            merge_df, self.company_info_index, self.shipping_details['domestic_source_of_goods']
+        )
         # merge_df合并declared_unit_price_df，获取SKU对应的申报单价
         merge_df = merge_df.merge(declared_unit_price_df, left_on="SKU", right_on="*SKU", how="left")
         # 如果申报单价列有为NaN的数据就报错,并且将那一行数据输出
@@ -1150,27 +1200,29 @@ class CustomsDeclaration:
         # 新增是否含金刚石列
         merge_df['是否含金刚石'] = merge_df['材质'].str.contains('金刚石', na=False)
 
-        # 对数据进行分组，对同一报关中文品名、是否含金刚石分组，合计申报总价、发货数量、总重量（kg）-箱子、箱数、总体积（m³）-箱子、'箱子总毛重（kg）'、'总PCS'
+        declaration_group_cols = ['报关中文品名', '是否含金刚石', '境内货源地', '境内货源地显示']
+
+        # 对数据进行分组，对同一报关中文品名、是否含金刚石、境内货源地分组，合计申报总价、发货数量、总重量（kg）-箱子、箱数、总体积（m³）-箱子、'箱子总毛重（kg）'、'总PCS'
         sum_df = (merge_df
-                  .groupby(['报关中文品名', '是否含金刚石'], as_index=False)[
+                  .groupby(declaration_group_cols, as_index=False)[
                       ['申报总价', '发货数量', '总重量（kg）-箱子', '箱数', '总体积（m³）-箱子', '箱子总毛重（kg）', '总PCS']]
                   .sum())
 
         # 用 apply 单独取每组申报总价最多的 SKU,以及获取SKU对应的箱子长度（cm）、箱子宽度（cm）
         top_sku_sr = (merge_df
                       .sort_values('申报总价', ascending=False)
-                      .groupby(['报关中文品名', '是否含金刚石'])[['SKU']]
+                      .groupby(declaration_group_cols)[['SKU', '供应商名称', '采购员']]
                       .first())
 
         # 用 apply 单独取每组箱数、总体积（m³）-箱子最多的长度和宽度
         top_length_sr = (merge_df
                          .sort_values(['箱数', '总体积（m³）-箱子'], ascending=False)
-                         .groupby(['报关中文品名', '是否含金刚石'])[['箱子长度（cm）', '箱子宽度（cm）']]
+                         .groupby(declaration_group_cols)[['箱子长度（cm）', '箱子宽度（cm）']]
                          .first())
 
         # 合并结果
-        temp_df = sum_df.merge(top_sku_sr, on=['报关中文品名', '是否含金刚石'])
-        result_df = temp_df.merge(top_length_sr, on=['报关中文品名', '是否含金刚石'])
+        temp_df = sum_df.merge(top_sku_sr, on=declaration_group_cols)
+        result_df = temp_df.merge(top_length_sr, on=declaration_group_cols)
 
         # 申报单价,保留两位小数
         result_df['申报单价'] = (result_df['申报总价'] / result_df['发货数量']).round(2)
@@ -1179,7 +1231,7 @@ class CustomsDeclaration:
         result_df['单箱重量'] = (result_df['总重量（kg）-箱子'] / result_df['箱数'])
 
         # 获取英文品名、中国报关\nhs编码、单位、供应商名称
-        temp_df = product_df[['*SKU', '英文品名', 'HS CODE', '单位', '供应商名称']]
+        temp_df = product_df[['*SKU', '英文品名', 'HS CODE', '单位']]
         result_df = result_df.merge(temp_df, left_on="SKU", right_on="*SKU", how="left")
         # 删除'*SKU'列
         result_df.drop(columns=['*SKU'], inplace=True)
@@ -1187,7 +1239,7 @@ class CustomsDeclaration:
         # 包装种类
         result_df['包装种类'] = '纸箱'
         # 总价
-        result_df['总价'] = result_df['发货数量'] * result_df['申报单价']
+        result_df['总价'] = (result_df['发货数量'] * result_df['申报单价']).round(2)
         # 每件毛重KGS
         result_df['每件毛重KGS'] = (result_df['箱子总毛重（kg）'] / result_df['箱数'])
         # 每件净重KGS
@@ -1215,7 +1267,8 @@ class CustomsDeclaration:
         result_df = result_df[
             ['SKU', '报关中文品名', '英文品名', 'HS CODE', '发货数量', '单位', '箱数', '包装种类', '申报单价',
              '总价', '每件毛重KGS', '箱子总毛重（kg）', '每件净重KGS', '共重净重KGS', '箱子长度（cm）', '箱子宽度（cm）',
-             '箱子高度（cm）', '体积', '总PCS', '是否含金刚石']]
+             '箱子高度（cm）', '体积', '总PCS', '是否含金刚石',
+             '境内货源地', '境内货源地显示', '供应商名称', '采购员']]
 
         # 总发货数量
         self.shipping_details['TOTAL_QUANTITY'] = result_df['发货数量'].sum()
@@ -1229,6 +1282,7 @@ class CustomsDeclaration:
         self.shipping_details['TOTAL_MEAS'] = result_df['体积'].sum().round(2)
         # 总价
         self.shipping_details['TOTAL_PRICE'] = result_df['总价'].sum().round(2)
+        update_dominant_source_display(self.shipping_details, result_df)
 
         # 筛选发货单详情Sheet页的字段
         invoice_details_df = invoice_details_df[['SKU', '店铺']]
@@ -1257,8 +1311,8 @@ class CustomsDeclaration:
                 del wb[self.sheet_name[0]]
             ws = wb.create_sheet(self.sheet_name[0])
 
-        # 如果是素桐，就显示上海浦东新区
-        domestic_source_display = "上海浦东新区" if self.company_info_index == 2 else "杭州其他"
+        default_domestic_source_display = "上海浦东新区" if self.company_info_index == 2 else "杭州其他"
+        domestic_source_display = self.shipping_details.get('domestic_source_display', default_domestic_source_display)
 
         # 设置数据
         excel_data = [
@@ -1299,8 +1353,11 @@ class CustomsDeclaration:
         detailed_list_df = self.result_df.copy()
 
         # 将result_data中的列表加入到excel_data
-        # 删除'店铺','总PCS','是否含金刚石'列
-        detailed_list_df.drop(columns=['店铺', '总PCS', '是否含金刚石'], inplace=True)
+        drop_cols = [
+            '店铺', '总PCS', '是否含金刚石', '申报总价_未含运费',
+            '境内货源地', '境内货源地显示', '供应商名称', '采购员',
+        ]
+        detailed_list_df.drop(columns=[col for col in drop_cols if col in detailed_list_df.columns], inplace=True)
 
         detailed_list__data = detailed_list_df.values.tolist()
         excel_data.extend(detailed_list__data)
@@ -1423,6 +1480,7 @@ class CustomsDeclaration:
             "K13:L13",  # 毛重 KGS
             "M13:N13",  # 净重 KGS
             "O13:Q13",  # 尺寸 KGS
+            f"G{max_row}:H{max_row}",  # 包装件数合计
             f"I{max_row}:J{max_row}",  # 总价合计
             f"K{max_row}:L{max_row}",  # 毛重 KGS合计
             f"M{max_row}:N{max_row}",  # 净重 KGS合计
@@ -2017,14 +2075,14 @@ class CustomsDeclaration:
         ]
 
         # 插入的数据
-        result_data = self.result_df.values.tolist()
         insert_data = []
-        for i in range(0, len(result_data)):
-            temp_data = result_data[i]
+        for i, row in self.result_df.reset_index(drop=True).iterrows():
+            temp_data = row.tolist()
+            row_source = row.get('境内货源地', self.shipping_details['domestic_source_of_goods'])
             insert_data.append(
                 [i + 1, temp_data[3], temp_data[1], '', temp_data[4], temp_data[5], temp_data[8], temp_data[9],
                  '（502）\n美元', '中国', '', self.shipping_details['country_zh'], '',
-                 self.shipping_details['domestic_source_of_goods'], '照章征税'])
+                 row_source, '照章征税'])
         # 数据行的长度
         data_row = len(insert_data)
 
@@ -2505,20 +2563,32 @@ class CustomsDeclaration:
         invoice_details_df = self._read_excel_cached(
             invoice_filepath,
             sheet_name=self.invoice_detail_sheet_name,
-            usecols=[
-                'SKU', '运输方式', '物流商单号', '店铺', '物流中心编码', '发货单号', '发货仓库（单据）', '物流商'
-            ],
         )
+        warehouse_column = next(
+            (
+                column for column in ('发货仓库（单据明细）', '发货仓库（单据）')
+                if column in invoice_details_df.columns
+            ),
+            None,
+        )
+        if warehouse_column is None:
+            raise ValueError(
+                "登记出运明细失败：发货单详情缺少“发货仓库（单据明细）”或“发货仓库（单据）”列"
+            )
+
         invoice_details_df['SKU'] = invoice_details_df['SKU'].astype(str)
         invoice_details_df['店铺'] = invoice_details_df['店铺'].str.split('[ -]').str[0].str.upper()
         # invoice_details_df.loc[invoice_details_df['店铺'] == "SIXPRAY", '店铺'] = "TOLESA"
         invoice_details_df = invoice_details_df[
-            ['SKU', '运输方式', '物流商单号', '店铺', '物流中心编码', '发货单号', '发货仓库（单据）', '物流商']]
+            ['SKU', '运输方式', '物流商单号', '店铺', '物流中心编码', '发货单号', warehouse_column, '物流商']]
         invoice_details_df = invoice_details_df.ffill()
-        # 如果发货仓库（单据）等于杭州虚拟仓，就为"工厂直发"，否则为"仓库发货"
-        invoice_details_df['发货仓库（单据）'] = invoice_details_df['发货仓库（单据）'].apply(
-            lambda x: "工厂直发" if x == "杭州虚拟仓" else "仓库发货"
+        # 优先使用发货仓库（单据明细）；旧发货单没有该列时回退到发货仓库（单据）。
+        warehouse_source = invoice_details_df[warehouse_column].fillna("").astype(str).str.strip()
+        invoice_details_df['发货仓库（单据）'] = np.where(
+            warehouse_source.eq("杭州虚拟仓"), "工厂直发", "仓库发货"
         )
+        if warehouse_column != '发货仓库（单据）':
+            invoice_details_df.drop(columns=[warehouse_column], inplace=True)
 
         # 装箱信息可为同一SKU拆出多行；详情信息只提供每个SKU的公共物流属性。
         detail_keys = ['SKU', '发货单号']
@@ -2717,12 +2787,19 @@ class CustomsDeclaration:
         currency = "USD"
 
         # 读取产品信息单证专用
+        register_product_cols = ['*SKU', '*品名', '报关中文品名', '供应商名称', '采购员']
         product_df = self._read_excel_cached(
-            product_filepath, sheet_name=self.product_sheet_name, usecols=['*SKU', '报关中文品名']
+            product_filepath,
+            sheet_name=self.product_sheet_name,
+            usecols=lambda column: column in register_product_cols,
         )
         # 将*SKU转为字符串
         product_df['*SKU'] = product_df['*SKU'].astype(str)
-        product_df = product_df[['*SKU', '报关中文品名']]
+        product_df = _normalize_product_declaration_names(product_df)
+        for optional_col in ['供应商名称', '采购员']:
+            if optional_col not in product_df.columns:
+                product_df[optional_col] = ''
+        product_df = product_df[['*SKU', '报关中文品名', '供应商名称', '采购员']]
         product_df = product_df.rename(columns={"*SKU": "SKU"})
 
         # 读取发货单数据
@@ -2735,14 +2812,22 @@ class CustomsDeclaration:
 
         # 合并数据
         merged_df = invoice_df.merge(product_df, on="SKU", how="left")
+        if self.company_info_index == 1:
+            merged_df = apply_lumiya_source_columns(
+                merged_df, self.company_info_index, self.shipping_details['domestic_source_of_goods']
+            )
         merged_df["报关渠道"] = customs_declaration_channels
         merged_df["出口日期"] = ""
         merged_df["预录单编号"] = ""
         merged_df["报关方式（9710/一般贸易）"] = customs_declaration_method
         merged_df["成交方式(FOB/CIF/CFR)"] = transaction_method
-        merged_df = merged_df[
-            ['报关渠道', '物流商单号', '出口日期', '预录单编号', '报关方式（9710/一般贸易）', '成交方式(FOB/CIF/CFR)',
-             '店铺', '报关中文品名', 'SKU', '发货数量']]
+        merged_columns = [
+            '报关渠道', '物流商单号', '出口日期', '预录单编号', '报关方式（9710/一般贸易）', '成交方式(FOB/CIF/CFR)',
+            '店铺', '报关中文品名', 'SKU', '发货数量'
+        ]
+        if self.company_info_index == 1:
+            merged_columns.extend(['境内货源地', '境内货源地显示', '供应商名称', '采购员'])
+        merged_df = merged_df[merged_columns]
 
         # 读取报关资料表
         customs_declaration_df = self.result_df.copy()
@@ -2812,6 +2897,34 @@ class CustomsDeclaration:
             register_df = register_df.reset_index(drop=True)
         return register_df, register_filepath, sheet_name, brand, original_rows
 
+    def build_invoicing_register_entries(
+            self, invoice_filepath: str, product_filepath: str, lumiya_register_filepath: str,
+            easycan_register_filepath: str, sutong_register_filepath: str, liulang_register_filepath: str,
+            jiangsheng_register_filepath: str) -> list[tuple[pd.DataFrame, str, str, str, int]]:
+        """构建报关开票登记写入项，鲁米亚宁波德韵拆到外部开票表。"""
+        register_df, register_filepath, sheet_name, brand, original_rows = self.build_invoicing_register_df(
+            invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
+            sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
+        )
+        if self.company_info_index != 1:
+            return [(register_df, register_filepath, sheet_name, brand, original_rows)]
+
+        currency = self.shipping_details.get('currency', 'USD')
+        source_register_df = attach_lumiya_register_source(register_df, self.result_df, self.company_info_index)
+        internal_register_df = build_lumiya_internal_declaration_register(
+            source_register_df, self.result_df, self.company_info_index, "发货数量", currency
+        )
+        external_register_df = build_lumiya_external_declaration_register(
+            source_register_df, self.result_df, self.company_info_index, "物流商单号", "发货数量", currency
+        )
+        return [
+            (entry_df, entry_filepath, entry_sheet, brand, original_rows)
+            for entry_df, entry_filepath, entry_sheet in split_lumiya_register_entries(
+                source_register_df, self.company_info_index, register_filepath, "物流商单号",
+                external_register_df, internal_register_df
+            )
+        ]
+
     def write_invoicing_register(self, register_df: pd.DataFrame, register_filepath: str,
                                  sheet_name: str, brand: str, original_rows: int,
                                  deleted_rows: int) -> int:
@@ -2867,7 +2980,7 @@ class CustomsDeclaration:
 
             # 对指定行设置边框
             frame_data = {
-                'min_row': start_row, 'max_row': worksheet.max_row, 'min_col': 1, 'max_col': 20
+                'min_row': start_row, 'max_row': worksheet.max_row, 'min_col': 1, 'max_col': end_col
             }
             self.seeting_excel_format(worksheet, frame_data, "frame")
 
@@ -2913,11 +3026,12 @@ class CustomsDeclaration:
                            easycan_register_filepath: str, sutong_register_filepath: str,
                            liulang_register_filepath: str, jiangsheng_register_filepath: str) -> None:
         """报关开票登记"""
-        register_df, register_filepath, sheet_name, brand, original_rows = self.build_invoicing_register_df(
+        register_entries = self.build_invoicing_register_entries(
             invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
             sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
         )
-        self.write_invoicing_register(register_df, register_filepath, sheet_name, brand, original_rows, 0)
+        for register_df, register_filepath, sheet_name, brand, original_rows in register_entries:
+            self.write_invoicing_register(register_df, register_filepath, sheet_name, brand, original_rows, 0)
 
     def register_all_documents(self, invoice_filepath: str, invoice_number_register_filepath: str,
                                product_filepath: str, lumiya_register_filepath: str, easycan_register_filepath: str,
@@ -2928,11 +3042,12 @@ class CustomsDeclaration:
         source_file = os.path.basename(invoice_filepath)
         try:
             # 先构建报关开票登记数据，确定目标文件并检查可写
-            register_df, register_filepath, invoicing_sheet, brand, invoice_rows = self.build_invoicing_register_df(
+            register_entries = self.build_invoicing_register_entries(
                 invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
                 sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
             )
-            self.ensure_file_writable(register_filepath, "报关开票登记表")
+            for _register_df, register_filepath, _invoicing_sheet, _brand, _invoice_rows in register_entries:
+                self.ensure_file_writable(register_filepath, "报关开票登记表")
 
             # 登记出货发票号登记表
             sheet_name = '出运明细'
@@ -2947,18 +3062,19 @@ class CustomsDeclaration:
                 )
 
             # 报关开票登记
-            register_original_rows = self.find_last_data_row(register_filepath, invoicing_sheet)
-            deleted_rows = self.check_invoice_number(
-                register_filepath, self.shipping_details['invoice_number'], invoicing_sheet, '合同号'
-            )
-            expected_rows = register_original_rows - deleted_rows + len(register_df)
-            actual_rows = self.write_invoicing_register(
-                register_df, register_filepath, invoicing_sheet, brand, invoice_rows, deleted_rows
-            )
-            if actual_rows != expected_rows:
-                raise Exception(
-                    f"登记校验失败：出运明细行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
+            for register_df, register_filepath, invoicing_sheet, brand, invoice_rows in register_entries:
+                register_original_rows = self.find_last_data_row(register_filepath, invoicing_sheet)
+                deleted_rows = self.check_invoice_number(
+                    register_filepath, self.shipping_details['invoice_number'], invoicing_sheet, '合同号'
                 )
+                expected_rows = register_original_rows - deleted_rows + len(register_df)
+                actual_rows = self.write_invoicing_register(
+                    register_df, register_filepath, invoicing_sheet, brand, invoice_rows, deleted_rows
+                )
+                if actual_rows != expected_rows:
+                    raise Exception(
+                        f"登记校验失败：{invoicing_sheet}行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
+                    )
             append_call_record(
                 module_name="发货单",
                 action="登记数据",

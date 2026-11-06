@@ -27,7 +27,7 @@ class StockBasicInformationTests(unittest.TestCase):
         stock_details_df = pd.DataFrame(
             {
                 "备货单号": ["STOCK-001"],
-                "发货仓库（单据）": ["杭州虚拟仓"],
+                "发货仓库（产品）": ["杭州虚拟仓"],
                 "收货仓库": ["EZARC NA-US美国仓(AWD)"],
                 "sku": ["922101"],
             }
@@ -86,7 +86,7 @@ class StockBasicInformationTests(unittest.TestCase):
         stock_details_df = pd.DataFrame(
             {
                 "备货单号": ["STOCK-001"],
-                "发货仓库（单据）": ["杭州虚拟仓"],
+                "发货仓库（产品）": ["杭州虚拟仓"],
                 "收货仓库": ["FBT仓-TIKTOK"],
                 "sku": ["922101"],
             }
@@ -141,7 +141,7 @@ class StockBasicInformationTests(unittest.TestCase):
         stock_details_df = pd.DataFrame(
             {
                 "备货单号": ["STOCK-001"],
-                "发货仓库（单据）": ["良品仓"],
+                "发货仓库（产品）": ["良品仓"],
                 "收货仓库": ["EZARC NA-US美国仓(AWD)"],
                 "sku": ["922101"],
             }
@@ -194,7 +194,7 @@ class StockBasicInformationTests(unittest.TestCase):
         stock_details_df = pd.DataFrame(
             {
                 "备货单号": ["STOCK-001"],
-                "发货仓库（单据）": ["杭州虚拟仓"],
+                "发货仓库（产品）": ["杭州虚拟仓"],
                 "收货仓库": ["EZARC NA-US美国仓(AWD)"],
                 "sku": ["922101"],
             }
@@ -431,21 +431,20 @@ class StockFlowBehaviorTests(unittest.TestCase):
             )
 
         self.assertTrue(generator.prepare_called)
-        output_dir = "/tmp/out/INV-002 报关资料"
+        output_dir = os.path.join("/tmp/out", "INV-002 报关资料")
         self.assertEqual(generator.template_output_dir, "/tmp/out")
-        self.assertEqual(generator.template_output_path, "/tmp/out/decl.xlsx")
+        self.assertEqual(generator.template_output_path, os.path.join("/tmp/out", "decl.xlsx"))
+        xlsx_path = os.path.join(output_dir, "INV-002 报关资料.xlsx")
+        pdf_path = os.path.join(output_dir, "INV-002 报关资料.pdf")
+        contract_pdf_path = os.path.join(output_dir, "INV-002 销售合同.pdf")
         self.assertEqual(
             generator.page_view_paths,
             [
-                f"{output_dir}/INV-002 报关资料.xlsx",
+                xlsx_path,
             ],
         )
-        export_workbook_to_pdf.assert_called_once_with(
-            f"{output_dir}/INV-002 报关资料.xlsx", f"{output_dir}/INV-002 报关资料.pdf"
-        )
-        export_worksheet_to_pdf.assert_called_once_with(
-            f"{output_dir}/INV-002 报关资料.xlsx", "合同", f"{output_dir}/INV-002 销售合同.pdf"
-        )
+        export_workbook_to_pdf.assert_called_once_with(xlsx_path, pdf_path)
+        export_worksheet_to_pdf.assert_called_once_with(xlsx_path, "合同", contract_pdf_path)
         self.assertEqual(len(generator.call_records), 1)
         self.assertTrue(generator.call_records[0]["success"])
         self.assertEqual(render_detailed_list.call_count, 1)
@@ -712,7 +711,7 @@ class StockRegisterTargetSelectionTests(unittest.TestCase):
                     "备货单号": "STOCK-001",
                     "收货仓库": "EZARC NA-US美国仓(AWD)",
                     "物流中心编码": "IUSP",
-                    "发货仓库（单据）": "杭州虚拟仓",
+                    "发货仓库（产品）": " 杭州虚拟仓 ",
                     "物流商": "物流商A",
                 },
                 {
@@ -720,7 +719,7 @@ class StockRegisterTargetSelectionTests(unittest.TestCase):
                     "备货单号": "STOCK-002",
                     "收货仓库": "FBT仓-TIKTOK",
                     "物流中心编码": "FBT",
-                    "发货仓库（单据）": "义乌仓",
+                    "发货仓库（产品）": "义乌仓",
                     "物流商": "物流商A",
                 },
             ]
@@ -847,6 +846,129 @@ class StockRegisterTargetSelectionTests(unittest.TestCase):
         self.assertEqual(sheet_name, "2026（内部开票）")
         self.assertEqual(register_df.loc[0, "报关方式（9710/一般贸易）"], 9810)
 
+    def test_build_invoicing_register_entries_lumiya_uses_currency(self):
+        generator = CustomsDeclaration()
+        generator.company_info_index = 1
+        generator.shipping_details = {
+            "currency": "USD",
+            "invoice_number": "INV-LUMIYA",
+            "domestic_source_of_goods": "宁波德韵",
+        }
+        generator.result_df = pd.DataFrame(
+            [
+                {
+                    "SKU": "SKU-1",
+                    "报关中文品名": "品名1",
+                    "英文品名": "Name1",
+                    "HS CODE": "HS1",
+                    "备货数量": 10,
+                    "单位": "PCS",
+                    "申报单价": 5.0,
+                    "总价": 50.0,
+                    "采购员": "张三",
+                    "供应商名称": "宁波德韵",
+                    "境内货源地": "宁波",
+                    "境内货源地显示": "宁波",
+                }
+            ]
+        )
+        fake_register_df = pd.DataFrame(
+            [
+                {
+                    "报关渠道": "海外仓",
+                    "合同号": "INV-LUMIYA",
+                    "出口日期": "",
+                    "预录单编号": "",
+                    "报关方式（9710/一般贸易）": 9710,
+                    "成交方式(FOB/CIF/CFR)": "CFR",
+                    "店铺": "LIBRATON",
+                    "报关中文品名": "品名1",
+                    "SKU": "SKU-1",
+                    "备货数量": 10,
+                    "境内货源地": "宁波",
+                    "境内货源地显示": "宁波",
+                    "供应商名称": "宁波德韵",
+                    "采购员": "张三",
+                    "开票/报关品名": "品名1",
+                    "英文品名": "Name1",
+                    "HS CODE": "HS1",
+                    "数量": 10,
+                    "单位": "PCS",
+                    "申报单价": 5.0,
+                    "总价": 50.0,
+                    "币别": "USD",
+                }
+            ]
+        )
+
+        with patch.object(generator, "build_invoicing_register_df", return_value=(fake_register_df, "lumiya.xlsx", "2026（内部开票）", "LIBRATON")):
+            entries = generator.build_invoicing_register_entries(
+                "invoice.xlsx", "product.xlsx", "lumiya.xlsx", "easycan.xlsx",
+                "sutong.xlsx", "liulang.xlsx", "jiangsheng.xlsx"
+            )
+
+        self.assertTrue(len(entries) > 0)
+        for entry_df, entry_filepath, entry_sheet, brand in entries:
+            self.assertEqual(brand, "LIBRATON")
+            self.assertIn("币别", entry_df.columns)
+            self.assertTrue((entry_df["币别"] == "USD").all())
+
+    def test_stock_add_detailed_list_sheet_merges_total_packed_in_columns(self):
+        generator = CustomsDeclaration()
+        generator.shipping_details = {
+            'company_name_zh': '杭州易达工具有限公司',
+            'company_name_en': 'HANGZHOU EASYCAN TOOLS CO., LTD.',
+            'consignor': 'Consignor Info',
+            'today': 'Oct 30, 2026',
+            'invoice_number': 'INV-20261030',
+            'recipient': 'Recipient Info',
+            'domestic_source_display': '宁波其他',
+            'Logistics_center': 'POC3',
+            'country': 'USA',
+            'mark': 'FBA19TXCLX5J\nMADE IN CHINA',
+            'currency': 'USD',
+            'TOTAL_QUANTITY': 16221,
+            'TOTAL_PACKED_IN': 1004,
+            'TOTAL_PRICE': 204791.46,
+            'TOTAL_G.W': 14115.72,
+            'TOTAL_N.W': 13111.72,
+            'TOTAL_MEAS': 34.71,
+            'images': ['easycan_stamp', 'easycan_sign']
+        }
+        generator.result_df = pd.DataFrame([
+            {
+                'SKU': '80924511N',
+                '报关中文品名': '切割片',
+                '英文品名': 'Cut Off Wheel',
+                'HS CODE': '6804221000',
+                '发货数量': 444,
+                '单位': '套',
+                '箱数': 18,
+                '包装种类': '纸箱',
+                '申报单价': 5.48,
+                '总价': 2433.12,
+                '单品毛重(g)': 14.31,
+                '总毛重 KGS': 257.60,
+                '单品净重(g)': 13.31,
+                '总净重 KGS': 239.60,
+                '外箱规格长(cm)': 27.0,
+                '外箱规格宽(cm)': 27.0,
+                '外箱规格高(cm)': 25.91,
+                '总体积': 0.34
+            }
+        ])
+
+        wb = Workbook()
+        with patch.object(generator, "add_images"):
+            generator.add_detailed_list_sheet("dummy.xlsx", "dummy_img_dir", wb=wb)
+
+        ws = wb['明细单']
+        max_row = 14 + len(generator.result_df) + 1
+        expected_range = f"G{max_row}:H{max_row}"
+        merged_ranges_str = [str(r) for r in ws.merged_cells.ranges]
+        self.assertIn(expected_range, merged_ranges_str)
+
 
 if __name__ == "__main__":
     unittest.main()
+

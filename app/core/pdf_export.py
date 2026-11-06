@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 
-from app.core.office_automation import start_isolated_office_application
+from app.core.office_automation import (
+    configure_office_local_printer,
+    start_isolated_office_application,
+)
 
 try:
     import win32com.client as win32
@@ -19,7 +22,26 @@ def _open_office_workbook(workbook_path: str):
     if app is None or not hasattr(app, "Workbooks"):
         raise RuntimeError("无法启动 WPS 或 Excel，无法导出 PDF。")
 
-    return app, app.Workbooks.Open(os.path.abspath(workbook_path))
+    workbook = app.Workbooks.Open(os.path.abspath(workbook_path))
+    configure_office_local_printer(app)
+    worksheets = getattr(workbook, "Worksheets", None)
+    if worksheets is not None:
+        try:
+            for sheet in worksheets:
+                page_setup = getattr(sheet, "PageSetup", None)
+                if page_setup is not None:
+                    page_setup.Zoom = False
+                    page_setup.PaperSize = 9
+                    page_setup.Orientation = 1
+                    page_setup.FitToPagesWide = 1
+                    if str(getattr(sheet, "Name", "")).strip() in ("要素", "elements"):
+                        page_setup.FitToPagesTall = False
+                    else:
+                        page_setup.FitToPagesTall = 1
+        except (TypeError, Exception):
+            pass
+    return app, workbook
+
 
 
 def _export_to_pdf(workbook_path: str, output_path: str, exporter, description: str) -> None:

@@ -168,16 +168,15 @@ class InvoiceFlowImportTests(unittest.TestCase):
 
         self.assertFalse(generator.lcl_flag)
         self.assertEqual(generator.process_invoice_calls, 1)
-        output_dir = "/tmp/out/INV-001 报关资料"
+        output_dir = os.path.join("/tmp/out", "INV-001 报关资料")
         self.assertEqual(generator.template_output_dir, "/tmp/out")
-        self.assertEqual(generator.template_output_path, "/tmp/out/decl.xlsx")
-        self.assertEqual(generator.page_view_paths, [f"{output_dir}/INV-001 报关资料.xlsx"])
-        export_workbook_to_pdf.assert_called_once_with(
-            f"{output_dir}/INV-001 报关资料.xlsx", f"{output_dir}/INV-001 报关资料.pdf"
-        )
-        export_worksheet_to_pdf.assert_called_once_with(
-            f"{output_dir}/INV-001 报关资料.xlsx", "合同", f"{output_dir}/INV-001 销售合同.pdf"
-        )
+        self.assertEqual(generator.template_output_path, os.path.join("/tmp/out", "decl.xlsx"))
+        xlsx_path = os.path.join(output_dir, "INV-001 报关资料.xlsx")
+        pdf_path = os.path.join(output_dir, "INV-001 报关资料.pdf")
+        contract_pdf_path = os.path.join(output_dir, "INV-001 销售合同.pdf")
+        self.assertEqual(generator.page_view_paths, [xlsx_path])
+        export_workbook_to_pdf.assert_called_once_with(xlsx_path, pdf_path)
+        export_worksheet_to_pdf.assert_called_once_with(xlsx_path, "合同", contract_pdf_path)
         self.assertEqual(len(generator.call_records), 1)
         self.assertTrue(generator.call_records[0]["success"])
         self.assertEqual(render_detailed_list.call_count, 1)
@@ -258,7 +257,7 @@ class InvoiceRegisterTargetSelectionTests(unittest.TestCase):
                     "店铺": "EZARC",
                     "物流中心编码": "ONT6",
                     "发货单号": "SHIP-001",
-                    "发货仓库（单据）": "杭州虚拟仓",
+                    "发货仓库（单据）": " 杭州虚拟仓 ",
                     "物流商": "物流商A",
                 },
                 {
@@ -278,6 +277,44 @@ class InvoiceRegisterTargetSelectionTests(unittest.TestCase):
             result = generator.register_combined_invoice("invoice.xlsx")
 
         self.assertEqual(result["发货仓库（单据）"].tolist(), ["工厂直发", "仓库发货"])
+
+    def test_register_combined_invoice_prefers_detail_warehouse_column(self):
+        generator = CustomsDeclaration()
+        invoice_df = pd.DataFrame([
+            {
+                "发货单号": "SHIP-001",
+                "SKU": "SKU-1",
+                "发货数量": 1,
+                "箱数": 1,
+                "总重量（kg）-箱子": 10,
+                "总体积（m³）-箱子": 0.1,
+                "国家": "美国",
+                "单箱数量": 1,
+                "货件单号": "FBA-1",
+                "箱子毛重（kg）": 10,
+                "箱子长度（cm）": 10,
+                "箱子宽度（cm）": 10,
+                "箱子高度（cm）": 10,
+            },
+        ])
+        invoice_details_df = pd.DataFrame([
+            {
+                "SKU": "SKU-1",
+                "运输方式": "海派",
+                "物流商单号": "INV-001",
+                "店铺": "EZARC",
+                "物流中心编码": "ONT6",
+                "发货单号": "SHIP-001",
+                "发货仓库（单据）": "良品仓",
+                "发货仓库（单据明细）": " 杭州虚拟仓 ",
+                "物流商": "物流商A",
+            },
+        ])
+
+        with patch.object(generator, "_read_excel_cached", side_effect=[invoice_df, invoice_details_df]):
+            result = generator.register_combined_invoice("invoice.xlsx")
+
+        self.assertEqual(result.loc[0, "发货仓库（单据）"], "工厂直发")
 
     def test_build_invoicing_register_df_for_sutong_deduplicates_sku_rows(self):
         generator = CustomsDeclaration()
@@ -1159,6 +1196,61 @@ class InvoiceLumiyaCompanyInfoTests(unittest.TestCase):
             self.assertEqual(written_rows, 2)
         finally:
             os.remove(temp_path)
+
+    def test_add_detailed_list_sheet_merges_total_packed_in_columns(self):
+        generator = CustomsDeclaration()
+        generator.shipping_details = {
+            'company_name_zh': '杭州易达工具有限公司',
+            'company_name_en': 'HANGZHOU EASYCAN TOOLS CO., LTD.',
+            'consignor': 'Consignor Info',
+            'today': 'Oct 30, 2026',
+            'invoice_number': 'INV-20261030',
+            'recipient': 'Recipient Info',
+            'domestic_source_display': '宁波其他',
+            'Logistics_center': 'POC3',
+            'country': 'USA',
+            'mark': 'FBA19TXCLX5J\nMADE IN CHINA',
+            'transportation_method': '海卡',
+            'TOTAL_QUANTITY': 16221,
+            'TOTAL_PACKED_IN': 1004,
+            'TOTAL_PRICE': 204791.46,
+            'TOTAL_G.W': 14115.72,
+            'TOTAL_N.W': 13111.72,
+            'TOTAL_MEAS': 34.71,
+            'images': ['easycan_stamp', 'easycan_sign']
+        }
+        generator.result_df = pd.DataFrame([
+            {
+                'SKU': '80924511N',
+                '报关中文品名': '切割片',
+                '英文品名': 'Cut Off Wheel',
+                'HS CODE': '6804221000',
+                '发货数量': 444,
+                '单位': '套',
+                '箱数': 18,
+                '包装种类': '纸箱',
+                '申报单价': 5.48,
+                '总价': 2433.12,
+                '单品毛重(g)': 14.31,
+                '总毛重 KGS': 257.60,
+                '单品净重(g)': 13.31,
+                '总净重 KGS': 239.60,
+                '外箱规格长(cm)': 27.0,
+                '外箱规格宽(cm)': 27.0,
+                '外箱规格高(cm)': 25.91,
+                '总体积': 0.34
+            }
+        ])
+
+        wb = Workbook()
+        with patch.object(generator, "add_images"):
+            generator.add_detailed_list_sheet("dummy.xlsx", "dummy_img_dir", wb=wb)
+
+        ws = wb['明细单']
+        max_row = 14 + len(generator.result_df) + 1
+        expected_range = f"G{max_row}:H{max_row}"
+        merged_ranges_str = [str(r) for r in ws.merged_cells.ranges]
+        self.assertIn(expected_range, merged_ranges_str)
 
 
 if __name__ == "__main__":

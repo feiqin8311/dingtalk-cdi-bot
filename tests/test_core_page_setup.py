@@ -30,6 +30,7 @@ class CorePageSetupTests(unittest.TestCase):
             reloaded = load_workbook(path)
             ws2 = reloaded.active
             self.assertEqual(ws2.sheet_view.view, "pageBreakPreview")
+            self.assertTrue(ws2.sheet_properties.pageSetUpPr.fitToPage)
             self.assertEqual(ws2.page_setup.fitToWidth, 1)
             self.assertEqual(ws2.page_setup.fitToHeight, 1)
         finally:
@@ -48,6 +49,7 @@ class CorePageSetupTests(unittest.TestCase):
             reloaded = load_workbook(path)
             ws2 = reloaded.active
             self.assertEqual(ws2.sheet_view.view, "pageBreakPreview")
+            self.assertTrue(ws2.sheet_properties.pageSetUpPr.fitToPage)
             self.assertEqual(ws2.page_setup.fitToWidth, 1)
             self.assertEqual(ws2.page_setup.fitToHeight, 1)
         finally:
@@ -62,10 +64,13 @@ class CorePageSetupTests(unittest.TestCase):
         try:
             wb.save(path)
             wb.close()
-            set_excel_page_view(path, enable_com=False)
+            with patch("app.core.page_setup.win32") as win32:
+                set_excel_page_view(path)
+                win32.DispatchEx.assert_not_called()
             reloaded = load_workbook(path)
             ws2 = reloaded.active
             self.assertEqual(ws2.sheet_view.view, "pageBreakPreview")
+            self.assertTrue(ws2.sheet_properties.pageSetUpPr.fitToPage)
             self.assertEqual(ws2.page_setup.fitToWidth, 1)
             self.assertEqual(ws2.page_setup.fitToHeight, 1)
         finally:
@@ -88,16 +93,59 @@ class CorePageSetupTests(unittest.TestCase):
 
             with patch("app.core.page_setup.win32") as win32:
                 win32.DispatchEx.return_value = app
-                set_excel_page_view(path)
+                set_excel_page_view(path, enable_com=True)
 
             win32.Dispatch.assert_not_called()
             win32.DispatchEx.assert_called_once_with("Ket.Application")
+            self.assertIs(app.PrintCommunication, False)
             office_workbook.Save.assert_called_once_with()
             office_workbook.Close.assert_called_once_with(False)
             app.Quit.assert_called_once_with()
         finally:
             os.remove(path)
 
+    def test_apply_persistent_page_setup_elements_sheet_unconstrained_height(self):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "要素"
+        apply_persistent_page_setup(ws)
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            path = tmp.name
+        try:
+            wb.save(path)
+            reloaded = load_workbook(path)
+            ws2 = reloaded["要素"]
+            self.assertEqual(ws2.sheet_view.view, "pageBreakPreview")
+            self.assertTrue(ws2.sheet_properties.pageSetUpPr.fitToPage)
+            self.assertEqual(ws2.page_setup.fitToWidth, 1)
+            self.assertEqual(ws2.page_setup.fitToHeight, 0)
+        finally:
+            if "reloaded" in locals():
+                reloaded.close()
+            os.remove(path)
+
+    def test_set_excel_page_view_elements_uses_unconstrained_height(self):
+        wb = Workbook()
+        ws_elements = wb.active
+        ws_elements.title = "要素"
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            path = tmp.name
+        try:
+            wb.save(path)
+            wb.close()
+            set_excel_page_view(path)
+            reloaded = load_workbook(path)
+            ws2 = reloaded["要素"]
+            self.assertEqual(ws2.sheet_view.view, "pageBreakPreview")
+            self.assertTrue(ws2.sheet_properties.pageSetUpPr.fitToPage)
+            self.assertEqual(ws2.page_setup.fitToWidth, 1)
+            self.assertEqual(ws2.page_setup.fitToHeight, 0)
+        finally:
+            if "reloaded" in locals():
+                reloaded.close()
+            os.remove(path)
+
 
 if __name__ == "__main__":
     unittest.main()
+
