@@ -311,11 +311,37 @@ class QTInterface(QMainWindow):
         # 登记设置相关文件路径
         self.invoice_number_register_filepath = r"\\192.168.0.45\供应链管理\2 物流发货管理\2026出运明细.xlsx"
         self.register_folder_path = r"\\192.168.0.45\供应链管理\2 物流发货管理\1 报关开票登记"
-        self.lumiya_register_filepath = os.path.join(self.register_folder_path, "2025.9-鲁米亚报关明细.xlsx")
-        self.easycan_register_filepath = os.path.join(self.register_folder_path, "2025.9-易达报关明细 修复.xlsx")
-        self.sutong_register_filepath = os.path.join(self.register_folder_path, "2025-素桐报关开票明细.xlsx")
-        self.liulang_register_filepath = os.path.join(self.register_folder_path, "2025-六浪报关明细.xlsx")
-        self.jiangsheng_register_filepath = os.path.join(self.register_folder_path, "2025-匠晟报关明细.xlsx")
+        self.lumiya_register_filepath = os.path.join(self.register_folder_path, "2.鲁米亚报关明细.xlsx")
+        self.easycan_register_filepath = os.path.join(self.register_folder_path, "1.易达报关明细.xlsx")
+        self.sutong_register_filepath = os.path.join(self.register_folder_path, "5.素桐报关明细.xlsx")
+        self.liulang_register_filepath = os.path.join(self.register_folder_path, "3.六浪报关明细.xlsx")
+        self.jiangsheng_register_filepath = os.path.join(self.register_folder_path, "4.匠晟报关明细.xlsx")
+
+        self.prod_register_paths = [
+            self.invoice_number_register_filepath,
+            self.lumiya_register_filepath,
+            self.easycan_register_filepath,
+            self.sutong_register_filepath,
+            self.liulang_register_filepath,
+            self.jiangsheng_register_filepath
+        ]
+        self.last_prod_register_paths = list(self.prod_register_paths)
+
+        # 本地测试文件夹路径 (优先使用本地 files 目录，备选 D:\Projects\dingtalk-cdi-bot\files)
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        test_dir = os.path.join(project_dir, "files")
+        if not os.path.exists(test_dir) and os.path.exists(r"D:\Projects\dingtalk-cdi-bot\files"):
+            test_dir = r"D:\Projects\dingtalk-cdi-bot\files"
+        self.test_folder_path = test_dir
+
+        self.test_register_paths = [
+            os.path.join(self.test_folder_path, "2026出运明细.xlsx"),
+            os.path.join(self.test_folder_path, "2.鲁米亚报关明细.xlsx"),
+            os.path.join(self.test_folder_path, "1.易达报关明细.xlsx"),
+            os.path.join(self.test_folder_path, "5.素桐报关明细.xlsx"),
+            os.path.join(self.test_folder_path, "3.六浪报关明细.xlsx"),
+            os.path.join(self.test_folder_path, "4.匠晟报关明细.xlsx")
+        ]
 
     def setup_styles(self):
         """设置应用样式"""
@@ -465,6 +491,25 @@ class QTInterface(QMainWindow):
 
         self.main_layout.addWidget(declaration_group)
 
+        # 测试选项区域（默认否）
+        test_group = QGroupBox("测试选项")
+        test_group.setFont(QFont("Segoe UI", 11))
+        test_layout = QHBoxLayout(test_group)
+        test_layout.setContentsMargins(15, 20, 15, 20)
+
+        self.test_no = QCheckBox("否")
+        self.test_yes = QCheckBox("是")
+        self.test_no.setChecked(True)
+        self.test_no.toggled.connect(self.on_test_mode_toggled)
+        self.test_yes.toggled.connect(self.on_test_mode_toggled)
+
+        test_layout.addWidget(QLabel("是否测试模式:"))
+        test_layout.addWidget(self.test_no)
+        test_layout.addWidget(self.test_yes)
+        test_layout.addStretch()
+
+        self.main_layout.addWidget(test_group)
+
         # 文件上传区域（其他文件，可折叠，默认折叠）
         self.upload_section = CollapsibleWidget("文件上传")
 
@@ -565,6 +610,37 @@ class QTInterface(QMainWindow):
             elif sender == self.declaration_no:
                 self.declaration_yes.setChecked(False)
 
+    def on_test_mode_toggled(self, checked):
+        """处理测试选项切换"""
+        if checked:
+            sender = self.sender()
+            if sender == self.test_yes:
+                self.test_no.setChecked(False)
+                # 记录切换前的正式路径
+                if hasattr(self, 'register_paths') and self.register_paths:
+                    current_paths = [
+                        p.layout().itemAt(1).widget().text().strip()
+                        for p in self.register_paths
+                    ]
+                    if current_paths != self.test_register_paths:
+                        self.last_prod_register_paths = current_paths
+                self.apply_register_paths(self.test_register_paths)
+                self.status_bar.showMessage(f"已开启测试模式：登记设置使用 files 目录测试文件")
+            elif sender == self.test_no:
+                self.test_yes.setChecked(False)
+                restore_paths = getattr(self, 'last_prod_register_paths', self.prod_register_paths)
+                self.apply_register_paths(restore_paths)
+                self.status_bar.showMessage("已关闭测试模式：登记设置使用正式路径")
+
+    def apply_register_paths(self, paths):
+        """更新登记设置输入框路径"""
+        if not hasattr(self, 'register_paths'):
+            return
+        for i, path in enumerate(paths):
+            if i < len(self.register_paths):
+                path_edit = self.register_paths[i].layout().itemAt(1).widget()
+                path_edit.setText(path)
+
     def create_file_widget(self, label_text, default_path, index, is_output=False):
         """创建文件路径选择控件"""
         widget = QWidget()
@@ -643,6 +719,8 @@ class QTInterface(QMainWindow):
             settings["register"] = "是" if self.register_yes.isChecked() else "否"
             # 保存申报选项
             settings["declaration"] = "是" if self.declaration_yes.isChecked() else "否"
+            # 保存测试模式选项
+            settings["test_mode"] = "是" if self.test_yes.isChecked() else "否"
 
             # 保存到文件
             with open(self.settings_file, 'w', encoding='utf-8') as f:
@@ -706,6 +784,14 @@ class QTInterface(QMainWindow):
                         self.declaration_yes.setChecked(False)
                         self.declaration_no.setChecked(True)
 
+                # 加载测试选项（默认为否）
+                if "test_mode" in settings and settings["test_mode"] == "是":
+                    self.test_yes.setChecked(True)
+                    self.test_no.setChecked(False)
+                else:
+                    self.test_yes.setChecked(False)
+                    self.test_no.setChecked(True)
+
                 self.status_bar.showMessage("默认设置已加载")
 
         except Exception as e:
@@ -749,9 +835,13 @@ class QTInterface(QMainWindow):
                 missing_files.append(self.base_file_labels[idx])
 
         # 收集登记设置区域的文件路径（仅在选择登记时必填）
+        is_test_mode = self.test_yes.isChecked()
         for i, path_widget in enumerate(self.register_paths):
             path_edit = path_widget.layout().itemAt(1).widget()
             path = path_edit.text().strip()
+            if is_test_mode and not path:
+                path = self.test_register_paths[i]
+                path_edit.setText(path)
             input_paths.append(path)
 
             if is_register and not path:

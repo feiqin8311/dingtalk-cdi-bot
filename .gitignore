@@ -9,3 +9,6 @@ dist/
 .vscode/
 Thumbs.db
 .DS_Store
+.venv/
+venv/
+files/

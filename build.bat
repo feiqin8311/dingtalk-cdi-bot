@@ -4,6 +4,15 @@ setlocal
 cd /d "%~dp0"
 
 set "ENV_NAME=%~1"
+
+if exist "%~dp0.venv\Scripts\pyinstaller.exe" (
+    if "%ENV_NAME%"=="" (
+        echo [1/3] Using local virtual environment: .venv
+        call "%~dp0.venv\Scripts\activate.bat"
+        goto :run_pyinstaller
+    )
+)
+
 if "%ENV_NAME%"=="" set "ENV_NAME=dingtalk-bot"
 
 echo [1/3] Activating conda environment: %ENV_NAME%
@@ -39,6 +48,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:run_pyinstaller
 echo [2/3] Running PyInstaller...
 pyinstaller --clean --noconfirm customs_declaration_info.spec
 if errorlevel 1 (
