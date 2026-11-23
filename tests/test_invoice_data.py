@@ -18,7 +18,7 @@ win32com_module.client = win32com_client
 sys.modules.setdefault("win32com", win32com_module)
 sys.modules.setdefault("win32com.client", win32com_client)
 
-from invoice_data import CustomsDeclaration
+from Invoice_Data import CustomsDeclaration
 
 
 class InvoiceBasicInformationTests(unittest.TestCase):

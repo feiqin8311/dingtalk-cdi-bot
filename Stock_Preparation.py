@@ -3297,8 +3297,9 @@ class CustomsDeclaration:
                                product_filepath: str, lumiya_register_filepath: str, easycan_register_filepath: str,
                                sutong_register_filepath: str, liulang_register_filepath: str, jiangsheng_register_filepath: str,
                                product_name_filepath: Optional[str] = None, site_address_filepath: Optional[str] = None,
-                               flag: Optional[bool] = None) -> None:
-        """登记所有数据"""
+                               flag: Optional[bool] = None, register_shipping: bool = True,
+                               register_customs: bool = True) -> None:
+        """按选择登记出运明细和报关开票明细。"""
         print("登记数据")
         start_time = datetime.datetime.now()
         source_file = os.path.basename(invoice_filepath)
@@ -3311,25 +3312,28 @@ class CustomsDeclaration:
                 )
 
             # 先构建报关开票登记数据，确认目标文件可写
-            register_entries = self.build_invoicing_register_entries(
-                invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
-                sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
-            )
-            for _register_df, register_filepath, _invoicing_sheet, _brand in register_entries:
-                self.ensure_file_writable(register_filepath, "报关开票登记表")
+            register_entries = []
+            if register_customs:
+                register_entries = self.build_invoicing_register_entries(
+                    invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
+                    sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
+                )
+                for _register_df, register_filepath, _invoicing_sheet, _brand in register_entries:
+                    self.ensure_file_writable(register_filepath, "报关开票登记表")
 
             # 登记出货发票号登记表
-            sheet_name = '出运明细'
-            shipping_original_rows = self.find_last_data_row(invoice_number_register_filepath, sheet_name)
-            insert_rows = len(self.register_combined_invoice(invoice_filepath, product_filepath))
-            deleted_rows, actual_rows = self.register_shipping_invoice_number(
-                invoice_filepath, invoice_number_register_filepath, product_filepath
-            )
-            expected_rows = shipping_original_rows - deleted_rows + insert_rows
-            if actual_rows != expected_rows:
-                raise Exception(
-                    f"登记校验失败：出运明细行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
+            if register_shipping:
+                sheet_name = '出运明细'
+                shipping_original_rows = self.find_last_data_row(invoice_number_register_filepath, sheet_name)
+                insert_rows = len(self.register_combined_invoice(invoice_filepath, product_filepath))
+                deleted_rows, actual_rows = self.register_shipping_invoice_number(
+                    invoice_filepath, invoice_number_register_filepath, product_filepath
                 )
+                expected_rows = shipping_original_rows - deleted_rows + insert_rows
+                if actual_rows != expected_rows:
+                    raise Exception(
+                        f"登记校验失败：出运明细行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
+                    )
 
             for register_df, register_filepath, invoicing_sheet, _brand in register_entries:
                 register_original_rows = self.find_last_data_row(register_filepath, invoicing_sheet)

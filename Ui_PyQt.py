@@ -8,8 +8,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QFont, QIcon
-import invoice_data
-import stock_preparation
+import Invoice_Data as invoice_data
+import Stock_Preparation as stock_preparation
 
 
 class ToggleButton(QPushButton):
@@ -120,7 +120,7 @@ class ProcessingThread(QThread):
     finished = pyqtSignal(bool, str)  # 信号：处理完成(成功, 消息)
 
     def __init__(self, input_paths, output_path, pictures_path, is_consolidation, is_register,
-                 is_declaration, use_stock):
+                 is_declaration, use_stock, register_shipping=True, register_customs=True):
         super().__init__()
         self.input_paths = input_paths
         self.output_path = output_path
@@ -129,12 +129,19 @@ class ProcessingThread(QThread):
         self.is_register = is_register
         self.is_declaration = is_declaration
         self.use_stock = use_stock
+        self.register_shipping = register_shipping
+        self.register_customs = register_customs
 
     def run(self):
         """执行处理任务"""
         try:
             # 检查文件是否存在
-            for path in [p for p in self.input_paths if p]:
+            paths_to_check = self.input_paths[:6]
+            if self.is_register and self.register_shipping:
+                paths_to_check += self.input_paths[6:7]
+            if self.is_register and self.register_customs:
+                paths_to_check += self.input_paths[7:12]
+            for path in [p for p in paths_to_check if p]:
                 if not os.path.exists(path):
                     self.finished.emit(False, f"文件不存在: {os.path.basename(path)}")
                     return
@@ -163,7 +170,9 @@ class ProcessingThread(QThread):
                         self.input_paths[11],  # 匠晟报关明细
                         self.input_paths[3],   # 品名
                         self.input_paths[4],   # 全站点地址
-                        self.is_consolidation
+                        self.is_consolidation,
+                        register_shipping=self.register_shipping,
+                        register_customs=self.register_customs,
                     )
             else:
                 generator = invoice_data.CustomsDeclaration()
@@ -187,7 +196,9 @@ class ProcessingThread(QThread):
                         self.input_paths[8],   # 易达报关明细
                         self.input_paths[9],   # 素桐报关开票明细
                         self.input_paths[10],  # 六浪报关明细
-                        self.input_paths[11]   # 匠晟报关明细
+                        self.input_paths[11],  # 匠晟报关明细
+                        register_shipping=self.register_shipping,
+                        register_customs=self.register_customs,
                     )
 
             # 处理成功
@@ -468,6 +479,12 @@ class QTInterface(QMainWindow):
         register_layout.addWidget(QLabel("是否登记:"))
         register_layout.addWidget(self.register_no)
         register_layout.addWidget(self.register_yes)
+        self.register_shipping = QCheckBox("出运明细登记")
+        self.register_customs = QCheckBox("报关明细登记")
+        self.register_shipping.setChecked(True)
+        self.register_customs.setChecked(True)
+        register_layout.addWidget(self.register_shipping)
+        register_layout.addWidget(self.register_customs)
         register_layout.addStretch()
 
         self.main_layout.addWidget(register_group)
@@ -600,6 +617,8 @@ class QTInterface(QMainWindow):
                 self.register_no.setChecked(False)
             elif sender == self.register_no:
                 self.register_yes.setChecked(False)
+        self.register_shipping.setEnabled(self.register_yes.isChecked())
+        self.register_customs.setEnabled(self.register_yes.isChecked())
 
     def on_declaration_toggled(self, checked):
         """处理申报选项切换"""
@@ -806,6 +825,11 @@ class QTInterface(QMainWindow):
 
         # 是否登记
         is_register = self.register_yes.isChecked()
+        register_shipping = is_register and self.register_shipping.isChecked()
+        register_customs = is_register and self.register_customs.isChecked()
+        if is_register and not (register_shipping or register_customs):
+            QMessageBox.critical(self, "登记选项", "请选择至少一项登记内容，或选择不登记。")
+            return
         # 是否生成申报文件
         is_declaration = self.declaration_yes.isChecked()
 
@@ -844,7 +868,8 @@ class QTInterface(QMainWindow):
                 path_edit.setText(path)
             input_paths.append(path)
 
-            if is_register and not path:
+            required = register_shipping if i == 0 else register_customs
+            if required and not path:
                 missing_files.append(self.register_file_labels[i])
 
         # 如果有必需文件未选择，弹出提示框
@@ -871,7 +896,8 @@ class QTInterface(QMainWindow):
 
         # 创建并启动处理线程
         self.processing_thread = ProcessingThread(
-            input_paths, output_path, self.pictures_path, is_consolidation, is_register, is_declaration, use_stock
+            input_paths, output_path, self.pictures_path, is_consolidation, is_register, is_declaration, use_stock,
+            register_shipping=register_shipping, register_customs=register_customs,
         )
         self.processing_thread.finished.connect(self.on_processing_finished)
         self.processing_thread.start()

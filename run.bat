@@ -2,9 +2,9 @@
 cd /d "%~dp0"
 
 if exist "%~dp0.venv\Scripts\python.exe" (
-    "%~dp0.venv\Scripts\python.exe" ui_pyqt.py
+    "%~dp0.venv\Scripts\python.exe" Ui_PyQt.py
 ) else (
-    python ui_pyqt.py
+    python Ui_PyQt.py
 )
 
 if errorlevel 1 (

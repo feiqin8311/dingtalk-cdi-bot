@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import QApplication
 # 确保 QApplication 初始化
 app = QApplication.instance() or QApplication([])
 
-from ui_pyqt import QTInterface
+from Ui_PyQt import QTInterface
 
 
 class TestUIOption(unittest.TestCase):

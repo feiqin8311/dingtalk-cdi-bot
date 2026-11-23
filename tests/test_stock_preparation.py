@@ -18,7 +18,7 @@ win32com_module.client = win32com_client
 sys.modules.setdefault("win32com", win32com_module)
 sys.modules.setdefault("win32com.client", win32com_client)
 
-from stock_preparation import CustomsDeclaration, _ELEMENTS_GROUP_CACHE
+from Stock_Preparation import CustomsDeclaration, _ELEMENTS_GROUP_CACHE
 
 
 class StockBasicInformationTests(unittest.TestCase):
@@ -306,7 +306,7 @@ class FindDataGroupOrderTests(unittest.TestCase):
         def fake_read_excel(_path, sheet_name=None, header=None):
             return elements_by_sheet[sheet_name].copy()
 
-        with patch("stock_preparation.pd.read_excel", side_effect=fake_read_excel):
+        with patch("Stock_Preparation.pd.read_excel", side_effect=fake_read_excel):
             groups = CustomsDeclaration.find_data_group("dummy.xlsx", result_df)
 
         self.assertEqual([group[-1] for group in groups], ["SKU-B-1", "SKU-A-1", "SKU-B-2"])
