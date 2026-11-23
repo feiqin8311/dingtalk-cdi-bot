@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['ui_pyqt.py'],
+    ['Ui_PyQt.py'],
     pathex=[],
     binaries=[],
     datas=[],
