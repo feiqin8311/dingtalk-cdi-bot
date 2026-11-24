@@ -1,8 +1,30 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from pywintypes import error as WindowsError
+import win32con
+import win32file
+
+
+@contextmanager
+def workbook_write_lock(path: Path, label: str):
+    """Serialize cooperating writers even while the destination is being replaced."""
+    lock_path = path.with_name(f'.{path.name}.write.lock')
+    try:
+        handle = win32file.CreateFile(
+            str(lock_path), win32con.GENERIC_WRITE | win32con.DELETE, 0, None,
+            win32con.OPEN_ALWAYS, win32con.FILE_ATTRIBUTE_HIDDEN | win32con.FILE_FLAG_DELETE_ON_CLOSE, None,
+        )
+    except WindowsError as exc:
+        raise RuntimeError(f'无法锁定{label}：可能正在写入，或没有共享目录写入权限，请重试') from exc
+    try:
+        yield
+    finally:
+        handle.Close()
 
 
 class ExcelCache:

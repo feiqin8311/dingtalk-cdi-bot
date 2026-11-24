@@ -17,27 +17,36 @@ from num2words import num2words
 from typing import List, Optional
 import os
 import shutil
+from io import BytesIO
+from pathlib import Path
+from time import perf_counter
 from bisect import bisect_left, bisect_right
 from openpyxl.drawing.image import Image
 import win32com.client as win32
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl import load_workbook
-from app.core.excel_io import ExcelCache
+from app.core.excel_io import ExcelCache, workbook_write_lock
 from app.core.models import select_register_filepath as core_select_register_filepath
 from app.core.logging import get_log_dir, log_message as core_log_message
 from app.core.metrics import append_call_record as core_append_call_record
 from app.core.page_setup import apply_persistent_page_setup as core_apply_persistent_page_setup
 from app.core.page_setup import set_excel_page_view as core_set_excel_page_view
 from app.core.text_layout import calculate_wrapped_text_height
+from app.core.workbook_staging import (
+    STAGING_CANCELLED_MESSAGE, WorkbookStagingAborted, WorkbookStagingCancelled, stage_customs_workbook,
+)
 from app.services.declared_price_service import select_declared_price_columns
 from app.services.elements_service import find_data_group as shared_find_data_group
 from app.services.freight_service import calculate_shipping_costs as shared_calculate_shipping_costs
+from app.services.ezarc_source_service import ezarc_maintenance_path, plan_ezarc_sources, sku_key
+from app.services.ezarc_source_service import split_ezarc_rows
 from app.services.lumiya_source_service import apply_lumiya_source_columns
 from app.services.lumiya_source_service import attach_lumiya_register_source
 from app.services.lumiya_source_service import build_lumiya_external_declaration_register
 from app.services.lumiya_source_service import build_lumiya_internal_declaration_register
 from app.services.lumiya_source_service import split_lumiya_register_entries
 from app.services.lumiya_source_service import update_dominant_source_display
+from app.services.shipping_register_service import append_shipping_register
 from app.renderers.common import ensure_default_sheet_removed, finalize_workbook_page_setup
 from app.renderers.detailed_list import render_detailed_list
 from app.renderers.packing_list import render_packing_list
@@ -58,6 +67,7 @@ _PRODUCT_INFO_COLS = [
     '单箱数量(pcs)', '材质', '货源地', '供应商名称', '采购员', '报关用采购成本(CNY)'
 ]
 _INVOICE_DETAILS_COLS = ['SKU', '物流中心编码', '运输方式', '物流商单号', '店铺', '物流商']
+_NON_LCL_DECLARATION_KEYS = ['报关中文品名', '是否含金刚石', '境内货源地', '境内货源地显示']
 _FONT_CACHE = {}
 _ALIGNMENT_CACHE = {}
 _FONT_CLS = Font
@@ -176,10 +186,14 @@ def _alignment(*args, **kwargs):
 class CustomsDeclaration:
     """生成报关资料"""
 
-    def __init__(self):
+    def __init__(self, maintenance_path=None):
         """存储数据"""
         self.shipping_details = {}
         self.result_df = None
+        self.ezarc_maintenance_path = maintenance_path if maintenance_path is not None else ezarc_maintenance_path()
+        self.ezarc_maintenance_update = None
+        self.ezarc_source_rows = None
+        self.physical_packing_df = None
         self._excel_cache = ExcelCache()
         self._product_name_cache = {}
         self._declared_price_cache = {}
@@ -1111,6 +1125,15 @@ class CustomsDeclaration:
 
         invoice_df, invoice_details_df, product_df = self.get_basic_information(invoice_filepath, site_address_filepath,
                                                                                 product_filepath)
+        self.lcl_flag = False
+        self.ezarc_maintenance_update = None
+        self.ezarc_source_rows = None
+        self.physical_packing_df = None
+        use_maintenance = self.shipping_details.get('brand') == 'EZARC'
+        if use_maintenance:
+            invoice_df['SKU'] = invoice_df['SKU'].map(sku_key)
+            invoice_details_df['SKU'] = invoice_details_df['SKU'].map(sku_key)
+            product_df['*SKU'] = product_df['*SKU'].map(sku_key)
         # 如果SKU列有重复的数据，就汇总合并
         if invoice_df['SKU'].duplicated().any():
             # 汇总数据，根据SKU分组，合并发货数量、箱数、总体积、总毛重，同一SKU的单箱数量、箱子毛重、箱子长度、箱子宽度、品名保持不变
@@ -1188,6 +1211,8 @@ class CustomsDeclaration:
             merge_df, self.company_info_index, self.shipping_details['domestic_source_of_goods']
         )
         # merge_df合并declared_unit_price_df，获取SKU对应的申报单价
+        if use_maintenance:
+            declared_unit_price_df['*SKU'] = declared_unit_price_df['*SKU'].map(sku_key)
         merge_df = merge_df.merge(declared_unit_price_df, left_on="SKU", right_on="*SKU", how="left")
         # 如果申报单价列有为NaN的数据就报错,并且将那一行数据输出
         self.check_data(merge_df, 'check_price')
@@ -1200,13 +1225,39 @@ class CustomsDeclaration:
         # 新增是否含金刚石列
         merge_df['是否含金刚石'] = merge_df['材质'].str.contains('金刚石', na=False)
 
-        declaration_group_cols = ['报关中文品名', '是否含金刚石', '境内货源地', '境内货源地显示']
+        if use_maintenance:
+            if merge_df['SKU'].duplicated().any():
+                raise ValueError('产品或申报单价资料存在重复 SKU，无法按 SKU 分摊报关数量')
+            allocations, self.ezarc_maintenance_update = plan_ezarc_sources(
+                self.ezarc_maintenance_path, self.shipping_details['invoice_number'],
+                merge_df.set_index('SKU')['发货数量'].to_dict(),
+            )
+            if any(item.external for item in allocations.values()):
+                self.physical_packing_df = self._summarize_non_lcl(merge_df, product_df)
+                self.ezarc_source_rows = split_ezarc_rows(merge_df, allocations)
+                merge_df = self.ezarc_source_rows
 
-        # 对数据进行分组，对同一报关中文品名、是否含金刚石、境内货源地分组，合计申报总价、发货数量、总重量（kg）-箱子、箱数、总体积（m³）-箱子、'箱子总毛重（kg）'、'总PCS'
-        sum_df = (merge_df
-                  .groupby(declaration_group_cols, as_index=False)[
-                      ['申报总价', '发货数量', '总重量（kg）-箱子', '箱数', '总体积（m³）-箱子', '箱子总毛重（kg）', '总PCS']]
-                  .sum())
+        result_df = self._summarize_non_lcl(merge_df, product_df)
+        physical = self.physical_packing_df if self.physical_packing_df is not None else result_df
+        self.shipping_details['TOTAL_QUANTITY'] = result_df['发货数量'].sum()
+        self.shipping_details['TOTAL_PACKED_IN'] = physical['箱数'].sum()
+        self.shipping_details['TOTAL_G.W'] = physical['箱子总毛重（kg）'].sum().round(2)
+        self.shipping_details['TOTAL_N.W'] = physical['共重净重KGS'].sum().round(2)
+        self.shipping_details['TOTAL_MEAS'] = physical['体积'].sum().round(2)
+        self.shipping_details['TOTAL_PRICE'] = result_df['总价'].sum().round(2)
+        update_dominant_source_display(self.shipping_details, result_df)
+
+        invoice_details_df = invoice_details_df[['SKU', '店铺']].drop_duplicates()
+        self.result_df = result_df.merge(invoice_details_df, on='SKU', how='left')
+        self.check_data(self.result_df, 'check_shop')
+
+    def _summarize_non_lcl(self, merge_df, product_df):
+        declaration_group_cols = _NON_LCL_DECLARATION_KEYS
+        sum_cols = ['申报总价', '发货数量', '总重量（kg）-箱子', '箱数', '总体积（m³）-箱子', '箱子总毛重（kg）', '总PCS']
+        split_sources = '报关箱数' in merge_df.columns
+        if split_sources:
+            sum_cols.append('报关箱数')
+        sum_df = merge_df.groupby(declaration_group_cols, as_index=False)[sum_cols].sum()
 
         # 用 apply 单独取每组申报总价最多的 SKU,以及获取SKU对应的箱子长度（cm）、箱子宽度（cm）
         top_sku_sr = (merge_df
@@ -1238,8 +1289,9 @@ class CustomsDeclaration:
 
         # 包装种类
         result_df['包装种类'] = '纸箱'
-        # 总价
-        result_df['总价'] = (result_df['发货数量'] * result_df['申报单价']).round(2)
+        # Retain the apportioned amount instead of multiplying a rounded unit price back out.
+        total = result_df['申报总价'] if split_sources else result_df['发货数量'] * result_df['申报单价']
+        result_df['总价'] = total.round(2)
         # 每件毛重KGS
         result_df['每件毛重KGS'] = (result_df['箱子总毛重（kg）'] / result_df['箱数'])
         # 每件净重KGS
@@ -1263,37 +1315,13 @@ class CustomsDeclaration:
             ['申报单价', '总价', '每件毛重KGS', '箱子总毛重（kg）', '每件净重KGS', '共重净重KGS', '箱子长度（cm）',
              '箱子宽度（cm）', '箱子高度（cm）', '体积']].round(2)
 
-        # 列顺序
-        result_df = result_df[
+        if split_sources:
+            result_df['箱数'] = result_df['报关箱数'].astype(int)
+        return result_df[
             ['SKU', '报关中文品名', '英文品名', 'HS CODE', '发货数量', '单位', '箱数', '包装种类', '申报单价',
              '总价', '每件毛重KGS', '箱子总毛重（kg）', '每件净重KGS', '共重净重KGS', '箱子长度（cm）', '箱子宽度（cm）',
              '箱子高度（cm）', '体积', '总PCS', '是否含金刚石',
              '境内货源地', '境内货源地显示', '供应商名称', '采购员']]
-
-        # 总发货数量
-        self.shipping_details['TOTAL_QUANTITY'] = result_df['发货数量'].sum()
-        # 总箱数
-        self.shipping_details['TOTAL_PACKED_IN'] = result_df['箱数'].sum()
-        # 总毛重 KGS
-        self.shipping_details['TOTAL_G.W'] = result_df['箱子总毛重（kg）'].sum().round(2)
-        # 总净重 KGS
-        self.shipping_details['TOTAL_N.W'] = result_df['共重净重KGS'].sum().round(2)
-        # 总体积
-        self.shipping_details['TOTAL_MEAS'] = result_df['体积'].sum().round(2)
-        # 总价
-        self.shipping_details['TOTAL_PRICE'] = result_df['总价'].sum().round(2)
-        update_dominant_source_display(self.shipping_details, result_df)
-
-        # 筛选发货单详情Sheet页的字段
-        invoice_details_df = invoice_details_df[['SKU', '店铺']]
-        # 去除重复数据
-        invoice_details_df = invoice_details_df.drop_duplicates()
-
-        # 合并result_df和invoice_details_df，根据SKU
-        self.result_df = result_df.merge(invoice_details_df, on="SKU", how="left")
-
-        # 检查物流商单号是否为空，为空就报错
-        self.check_data(self.result_df, "check_shop")
 
     def add_detailed_list_sheet(self, excel_file_path: str, image_path: str,
                                 wb: Optional[openpyxl.Workbook] = None) -> None:
@@ -1541,7 +1569,8 @@ class CustomsDeclaration:
         ]
 
         # 插入的数据
-        result_data = self.result_df.values.tolist()
+        packing_df = self.physical_packing_df if self.physical_packing_df is not None else self.result_df
+        result_data = packing_df.values.tolist()
         insert_data = []
         for temp_data in result_data:
             insert_data.append(
@@ -2681,10 +2710,9 @@ class CustomsDeclaration:
             raise Exception(f"{label}无法写入：{file_path}，原因：{e}")
 
     def register_shipping_invoice_number(self, invoice_filepath: str,
-                                         invoice_number_register_filepath: str) -> tuple[int, int, int]:
+                                         invoice_number_register_filepath: str, *, progress=None) -> tuple[int, int, int]:
         """登记出货发票号登记表"""
 
-        sheet_name = '出运明细'
         site = '亚马逊'
 
         result_df = self.register_combined_invoice(invoice_filepath)
@@ -2712,66 +2740,17 @@ class CustomsDeclaration:
         # 更换店铺，将 SIXPRAY替换为TOLESA
         result_df.loc[result_df['店铺'] == "SIXPRAY", '店铺'] = "TOLESA"
 
-        deleted_rows = 0
-        try:
-            # 检查发票号是否已经存在,如果存在就报错
-            column_name = '发票号'
-            deleted_rows = self.check_invoice_number(
-                invoice_number_register_filepath, self.shipping_details['invoice_number'],
-                sheet_name, column_name
-            )
-
-            # raise  Exception
-
-            # 找到工作表的最后一行
-            start_row = self.find_last_data_row(invoice_number_register_filepath, sheet_name) + 1
-
-            # 打开目标Excel文件
-            workbook = load_workbook(invoice_number_register_filepath)
-            worksheet = workbook[sheet_name]
-
-            # 将DataFrame转换为行数据
-            rows = list(dataframe_to_rows(result_df, index=False, header=False))
-
-            # 如无可写入数据，直接报错便于排查
-            if not rows:
-                raise ValueError("登记表生成的数据为空，未写入任何行")
-
-            original_rows = start_row - 1 + deleted_rows
-            expected_total = original_rows - deleted_rows + len(rows)
-
-            # 逐行写入数据，写完仅加边框
-            for r_idx, row in enumerate(rows, start_row):
-                for c_idx, value in enumerate(row, 1):
-                    # worksheet.cell(row=r_idx, column=c_idx, value=value)
-                    cell = worksheet.cell(row=r_idx, column=c_idx, value=value)
-                    # 设置边框
-                    cell.border = _THIN_BORDER
-            # 保存文件
-            workbook.save(invoice_number_register_filepath)
-
-            # 从文件实际读取登记后总行数
-            actual_total = self.find_last_data_row(invoice_number_register_filepath, sheet_name)
-            log_message(
-                f"登记出运明细 -> 文件: {os.path.basename(invoice_number_register_filepath)}, "
-                f"Sheet: {sheet_name}, 原始行数: {original_rows}, 本次新增行数: {len(rows)}, "
-                f"删除行数: {deleted_rows}, 预计登记后总行数: {expected_total}, 登记后总行数: {actual_total}, 发票号: {self.shipping_details['invoice_number']}"
-            )
-
-            # 校验登记是否写入成功
-            self.verify_register_written(
-                invoice_number_register_filepath, sheet_name, column_name, self.shipping_details['invoice_number']
-            )
-            return deleted_rows, actual_total, len(rows)
-
-        except Exception as e:
-            # 如果是PermissionError，说明有人占用文件
-            if isinstance(e, PermissionError):
-                raise Exception(
-                    f"登记失败：{invoice_number_register_filepath}！！！")
-            else:
-                raise Exception(
-                    f"{e}")
+        rows = list(dataframe_to_rows(result_df, index=False, header=False))
+        invoice = self.shipping_details['invoice_number']
+        original_rows, actual_total = append_shipping_register(
+            invoice_number_register_filepath, invoice, rows, progress=progress,
+        )
+        log_message(
+            f"登记出运明细 -> 文件: {os.path.basename(invoice_number_register_filepath)}, "
+            f"Sheet: 出运明细, 原始行数: {original_rows}, 本次新增行数: {len(rows)}, "
+            f"删除行数: 0, 登记后总行数: {actual_total}, 发票号: {invoice}"
+        )
+        return 0, actual_total, len(rows)
 
     def build_invoicing_register_df(self, invoice_filepath: str, product_filepath: str,
                                     lumiya_register_filepath: str, easycan_register_filepath: str,
@@ -2897,11 +2876,60 @@ class CustomsDeclaration:
             register_df = register_df.reset_index(drop=True)
         return register_df, register_filepath, sheet_name, brand, original_rows
 
+    def _build_ezarc_register_entries(self, register_filepath):
+        rows = self.ezarc_source_rows.sort_values('SKU')
+        brand = self.shipping_details['brand']
+        invoice = self.shipping_details['invoice_number']
+        currency = self.shipping_details.get('currency', 'USD')
+        common = ['报关渠道', '合同号', '出口日期', '预录单编号', '报关方式']
+        keys = _NON_LCL_DECLARATION_KEYS
+        summaries = self.result_df.drop_duplicates(keys).set_index(keys)
+        entries = []
+
+        internal_items = rows.loc[~rows['外部开票']]
+        if not internal_items.empty:
+            columns = common + ['成交方式', '品牌', '品名', 'SKU', '发货数量']
+            details = pd.DataFrame([
+                ['亚马逊', invoice, '', '', 9710, 'CFR', brand, name, sku, qty]
+                for name, sku, qty in internal_items[['报关中文品名', 'SKU', '发货数量']].itertuples(index=False, name=None)
+            ], columns=columns)
+
+            # 按旧版布局独立填充右侧汇总区：沿用报关单顺序，不按左侧 SKU 所在行对齐。
+            internal_keys = pd.MultiIndex.from_frame(internal_items[keys].drop_duplicates())
+            internal_summary = summaries.loc[summaries.index.isin(internal_keys)].reset_index()
+            if len(internal_summary) != len(internal_keys):
+                raise ValueError('易达内部开票缺少对应的报关汇总行')
+            declaration_columns = {
+                '报关中文品名': '开票/报关品名', '英文品名': '品名(英文）', 'HS CODE': '商品编码',
+                '发货数量': '数量', '单位': '开票单位', '申报单价': '单价', '总价': '总价',
+            }
+            declaration = internal_summary[list(declaration_columns)].rename(columns=declaration_columns)
+            declaration['币别'] = currency
+            internal = pd.concat([details, declaration], axis=1)
+            entries.append((internal, register_filepath, '2026（内部开票）', brand, len(rows)))
+
+        def join_labels(values):
+            labels = values.dropna().astype(str).str.strip()
+            return '、'.join(dict.fromkeys(label for label in labels if label))
+
+        external = []
+        for key, items in rows.loc[rows['外部开票']].groupby(keys):
+            group = summaries.loc[key, :]
+            external.append(['亚马逊', invoice, '', '', 9710, brand, key[0], join_labels(items['SKU']), group['HS CODE'],
+                             group['发货数量'], group['单位'], group['申报单价'], group['总价'], currency,
+                             join_labels(items['供应商名称']), join_labels(items['采购员'])])
+        if external:
+            columns = common + ['品牌', '品名', 'SKU', 'HS编码', '数量', '单位', '单价', '总价', '币别', '供应商名称', '采购员']
+            entries.append((pd.DataFrame(external, columns=columns), register_filepath, '2026（外部开票）', brand, len(rows)))
+        return entries
+
     def build_invoicing_register_entries(
             self, invoice_filepath: str, product_filepath: str, lumiya_register_filepath: str,
             easycan_register_filepath: str, sutong_register_filepath: str, liulang_register_filepath: str,
             jiangsheng_register_filepath: str) -> list[tuple[pd.DataFrame, str, str, str, int]]:
-        """构建报关开票登记写入项，鲁米亚宁波德韵拆到外部开票表。"""
+        """构建报关开票登记写入项，按规则分流内外部开票。"""
+        if self.ezarc_source_rows is not None and not self.lcl_flag:
+            return self._build_ezarc_register_entries(easycan_register_filepath)
         register_df, register_filepath, sheet_name, brand, original_rows = self.build_invoicing_register_df(
             invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
             sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
@@ -2924,6 +2952,53 @@ class CustomsDeclaration:
                 external_register_df, internal_register_df
             )
         ]
+
+    def _append_invoicing_register_rows(self, worksheet, rows, start_row, *, include_used_rows=False):
+        end_row = start_row + len(rows) - 1
+        format_end_row = max(end_row, worksheet.max_row) if include_used_rows else end_row
+        end_col = max(len(r) for r in rows)
+        ranges_to_restore = []
+        for merged_range in list(worksheet.merged_cells.ranges):
+            # 判断合并区域是否与写入区域有交集
+            if (merged_range.min_row <= end_row and merged_range.max_row >= start_row and
+                    merged_range.min_col <= end_col and merged_range.max_col >= 1):
+                # 记录需要恢复的上半部分
+                if merged_range.min_row < start_row:
+                    new_min_row = merged_range.min_row
+                    new_max_row = start_row - 1
+                    if (new_min_row < new_max_row) or (merged_range.min_col < merged_range.max_col):
+                        ranges_to_restore.append(
+                            (new_min_row, new_max_row, merged_range.min_col, merged_range.max_col))
+                # 记录需要恢复的下半部分
+                if merged_range.max_row > end_row:
+                    new_min_row = end_row + 1
+                    new_max_row = merged_range.max_row
+                    if (new_min_row < new_max_row) or (merged_range.min_col < merged_range.max_col):
+                        ranges_to_restore.append(
+                            (new_min_row, new_max_row, merged_range.min_col, merged_range.max_col))
+                worksheet.unmerge_cells(str(merged_range))
+
+        # 逐行写入数据；不复制上一行样式，后续统一加边框和合并
+        for r_idx, row in enumerate(rows, start_row):
+            for c_idx, value in enumerate(row, 1):
+                worksheet.cell(row=r_idx, column=c_idx, value=value)
+
+        # 对指定行设置边框
+        frame_data = {
+            'min_row': start_row, 'max_row': format_end_row, 'min_col': 1, 'max_col': end_col
+        }
+        self.seeting_excel_format(worksheet, frame_data, "frame")
+
+        # 合并发货日期和物流商单号列、货代公司
+        if start_row <= format_end_row:
+            worksheet.merge_cells(start_row=start_row, start_column=2, end_row=format_end_row, end_column=2)
+            # 居中对齐
+            cell = worksheet.cell(row=start_row, column=2)
+            cell.alignment = _alignment(horizontal='center', vertical='center')
+
+        # 恢复写入区域外被拆开的合并单元格
+        for min_row, max_row, min_col, max_col in ranges_to_restore:
+            worksheet.merge_cells(start_row=min_row, start_column=min_col, end_row=max_row, end_column=max_col)
 
     def write_invoicing_register(self, register_df: pd.DataFrame, register_filepath: str,
                                  sheet_name: str, brand: str, original_rows: int,
@@ -2950,50 +3025,7 @@ class CustomsDeclaration:
             expected_total = original_rows - deleted_rows + edited_rows
 
             # 处理写入区域内的合并单元格，避免写入MergedCell报错
-            end_row = start_row + len(rows) - 1
-            end_col = max(len(r) for r in rows)
-            ranges_to_restore = []
-            for merged_range in list(worksheet.merged_cells.ranges):
-                # 判断合并区域是否与写入区域有交集
-                if (merged_range.min_row <= end_row and merged_range.max_row >= start_row and
-                        merged_range.min_col <= end_col and merged_range.max_col >= 1):
-                    # 记录需要恢复的上半部分
-                    if merged_range.min_row < start_row:
-                        new_min_row = merged_range.min_row
-                        new_max_row = start_row - 1
-                        if (new_min_row < new_max_row) or (merged_range.min_col < merged_range.max_col):
-                            ranges_to_restore.append(
-                                (new_min_row, new_max_row, merged_range.min_col, merged_range.max_col))
-                    # 记录需要恢复的下半部分
-                    if merged_range.max_row > end_row:
-                        new_min_row = end_row + 1
-                        new_max_row = merged_range.max_row
-                        if (new_min_row < new_max_row) or (merged_range.min_col < merged_range.max_col):
-                            ranges_to_restore.append(
-                                (new_min_row, new_max_row, merged_range.min_col, merged_range.max_col))
-                    worksheet.unmerge_cells(str(merged_range))
-
-            # 逐行写入数据；不复制上一行样式，后续统一加边框和合并
-            for r_idx, row in enumerate(rows, start_row):
-                for c_idx, value in enumerate(row, 1):
-                    worksheet.cell(row=r_idx, column=c_idx, value=value)
-
-            # 对指定行设置边框
-            frame_data = {
-                'min_row': start_row, 'max_row': worksheet.max_row, 'min_col': 1, 'max_col': end_col
-            }
-            self.seeting_excel_format(worksheet, frame_data, "frame")
-
-            # 合并发货日期和物流商单号列、货代公司
-            if start_row <= worksheet.max_row:
-                worksheet.merge_cells(start_row=start_row, start_column=2, end_row=worksheet.max_row, end_column=2)
-                # 居中对齐
-                cell = worksheet.cell(row=start_row, column=2)
-                cell.alignment = _alignment(horizontal='center', vertical='center')
-
-            # 恢复写入区域外被拆开的合并单元格
-            for min_row, max_row, min_col, max_col in ranges_to_restore:
-                worksheet.merge_cells(start_row=min_row, start_column=min_col, end_row=max_row, end_column=max_col)
+            self._append_invoicing_register_rows(worksheet, rows, start_row, include_used_rows=True)
 
             # 保存文件
             workbook.save(register_filepath)
@@ -3022,6 +3054,119 @@ class CustomsDeclaration:
                 raise Exception(
                     f"{e}")
 
+    def _can_batch_ezarc_registration(self, entries):
+        return (bool(entries) and self.shipping_details.get('brand') == 'EZARC'
+                and getattr(self, 'ezarc_source_rows', None) is not None
+                and len({entry[1] for entry in entries}) == 1)
+
+    def _write_ezarc_register_batch(self, entries, *, progress=None, staging_state=None, staging_cancelled=None):
+        """Check both sheets, save one workbook, and verify it before replacing the original."""
+        path = Path(entries[0][1])
+        invoice = str(self.shipping_details['invoice_number']).strip()
+        if not invoice:
+            raise ValueError('合同号为空，未写入易达报关明细')
+
+        phase = None
+        phase_start = perf_counter()
+
+        def report(next_phase):
+            nonlocal phase, phase_start
+            now = perf_counter()
+            if phase is not None:
+                log_message(f'易达开票 {invoice} | {phase}耗时: {now - phase_start:.3f}s')
+            phase, phase_start = next_phase, now
+            if phase is not None:
+                log_message(f'易达开票 {invoice} | 开始{phase}：{path}')
+                if progress is not None:
+                    progress(f'报关开票：{phase}')
+
+        report('读取登记表')
+        owner_file = path.with_name(f'~${path.name}')
+        if owner_file.exists():
+            raise PermissionError(f'易达报关明细正在被占用：{path}')
+        snapshot = path.read_bytes()
+        report('本地查重并生成工作簿')
+        pending = []
+        cached = load_workbook(BytesIO(snapshot), read_only=True, data_only=True)
+        try:
+            for frame, _, sheet_name, brand, _ in entries:
+                if sheet_name not in cached.sheetnames:
+                    raise ValueError(f'易达报关明细缺少工作表：{sheet_name}')
+                sheet_rows = cached[sheet_name].values
+                header = next(sheet_rows, ())
+                if len(header) < 2 or header[1] != '合同号':
+                    raise ValueError(f'{sheet_name} 的 B 列不是“合同号”，请检查登记表')
+                last_row = 1
+                for index, row in enumerate(sheet_rows, 2):
+                    if len(row) > 1 and row[1] is not None and invoice in str(row[1]):
+                        raise ValueError(f'{sheet_name}：发票号已登记（{invoice}）')
+                    if any(value not in (None, '') for value in row):
+                        last_row = index
+                rows = list(dataframe_to_rows(frame, index=False, header=False))
+                if not rows:
+                    raise ValueError(f'{sheet_name} 的登记数据为空')
+                pending.append((sheet_name, brand, last_row + 1, rows))
+        finally:
+            cached.close()
+
+        with BytesIO() as updated:
+            workbook = load_workbook(BytesIO(snapshot))
+            try:
+                for sheet_name, _, start, rows in pending:
+                    self._append_invoicing_register_rows(workbook[sheet_name], rows, start)
+                workbook.save(updated)
+            finally:
+                workbook.close()
+
+            report('校验新增行')
+            verified = load_workbook(updated, read_only=True, data_only=True)
+            try:
+                for sheet_name, _, start, rows in pending:
+                    saved = list(verified[sheet_name].iter_rows(
+                        min_row=start, max_row=start + len(rows) - 1, max_col=2, values_only=True,
+                    ))
+                    if (len(saved) != len(rows) or saved[0][1] != invoice
+                            or any(written[0] != expected[0] for written, expected in zip(saved, rows))):
+                        raise ValueError(f'{sheet_name} 登记校验失败，原表未更新')
+            finally:
+                verified.close()
+
+            report('写入并刷盘临时文件')
+            try:
+                if staging_state is not None:
+                    staging_state(True)
+                try:
+                    staged_path = stage_customs_workbook(path, updated, progress=progress, cancelled=staging_cancelled)
+                finally:
+                    if staging_state is not None:
+                        staging_state(False)
+                # Accept a stop requested as the child exited, before disabling the stop button.
+                if staging_cancelled is not None and staging_cancelled():
+                    raise WorkbookStagingCancelled(
+                        f'{STAGING_CANCELLED_MESSAGE}共享目录可能残留临时文件：{staged_path.name}'
+                    )
+            except WorkbookStagingAborted:
+                report(None)
+                raise
+            report('复查原表并替换')
+            try:
+                with workbook_write_lock(path, '易达报关明细'):
+                    if owner_file.exists():
+                        raise PermissionError(f'易达报关明细正在被占用，原表未更新：{path}')
+                    if path.read_bytes() != snapshot:
+                        raise RuntimeError('易达报关明细在登记期间已被修改，原表未更新，请重试')
+                    os.replace(staged_path, path)
+            except BaseException:
+                staged_path.unlink(missing_ok=True)
+                raise
+            report(None)
+
+        for sheet_name, brand, start, rows in pending:
+            log_message(
+                f'登记报关开票 -> 文件: {path.name}, Sheet: {sheet_name}, 原始行数: {start - 1}, '
+                f'本次新增行数: {len(rows)}, 登记后总行数: {start - 1 + len(rows)}, 合同号: {invoice}, 店铺: {brand}'
+            )
+
     def register_invoicing(self, invoice_filepath: str, product_filepath: str, lumiya_register_filepath: str,
                            easycan_register_filepath: str, sutong_register_filepath: str,
                            liulang_register_filepath: str, jiangsheng_register_filepath: str) -> None:
@@ -3030,13 +3175,17 @@ class CustomsDeclaration:
             invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
             sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
         )
+        if self._can_batch_ezarc_registration(register_entries):
+            self._write_ezarc_register_batch(register_entries)
+            return
         for register_df, register_filepath, sheet_name, brand, original_rows in register_entries:
             self.write_invoicing_register(register_df, register_filepath, sheet_name, brand, original_rows, 0)
 
     def register_all_documents(self, invoice_filepath: str, invoice_number_register_filepath: str,
                                product_filepath: str, lumiya_register_filepath: str, easycan_register_filepath: str,
                                sutong_register_filepath: str, liulang_register_filepath: str, jiangsheng_register_filepath: str,
-                               register_shipping: bool = True, register_customs: bool = True) -> None:
+                               register_shipping: bool = True, register_customs: bool = True, *, progress=None,
+                               staging_state=None, staging_cancelled=None) -> None:
         """按选择登记出运明细和报关开票明细。"""
         print("登记数据")
         start_time = datetime.datetime.now()
@@ -3045,40 +3194,42 @@ class CustomsDeclaration:
             # 先构建报关开票登记数据，确定目标文件并检查可写
             register_entries = []
             if register_customs:
+                if progress is not None:
+                    progress('报关开票：检查登记表')
                 register_entries = self.build_invoicing_register_entries(
                     invoice_filepath, product_filepath, lumiya_register_filepath, easycan_register_filepath,
                     sutong_register_filepath, liulang_register_filepath, jiangsheng_register_filepath
                 )
-                for _register_df, register_filepath, _invoicing_sheet, _brand, _invoice_rows in register_entries:
+                for register_filepath in dict.fromkeys(entry[1] for entry in register_entries):
                     self.ensure_file_writable(register_filepath, "报关开票登记表")
 
-            # 登记出货发票号登记表
+            # 登记出运明细，新增行在写回前已校验。
             if register_shipping:
-                sheet_name = '出运明细'
-                shipping_original_rows = self.find_last_data_row(invoice_number_register_filepath, sheet_name)
-                deleted_rows, actual_rows, insert_rows = self.register_shipping_invoice_number(
-                    invoice_filepath, invoice_number_register_filepath
+                self.register_shipping_invoice_number(
+                    invoice_filepath, invoice_number_register_filepath, progress=progress,
                 )
-                expected_rows = shipping_original_rows - deleted_rows + insert_rows
-                if actual_rows != expected_rows:
-                    raise Exception(
-                        f"登记校验失败：出运明细行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
-                    )
 
             # 报关开票登记
-            for register_df, register_filepath, invoicing_sheet, brand, invoice_rows in register_entries:
-                register_original_rows = self.find_last_data_row(register_filepath, invoicing_sheet)
-                deleted_rows = self.check_invoice_number(
-                    register_filepath, self.shipping_details['invoice_number'], invoicing_sheet, '合同号'
+            if self._can_batch_ezarc_registration(register_entries):
+                self._write_ezarc_register_batch(
+                    register_entries, progress=progress, staging_state=staging_state, staging_cancelled=staging_cancelled,
                 )
-                expected_rows = register_original_rows - deleted_rows + len(register_df)
-                actual_rows = self.write_invoicing_register(
-                    register_df, register_filepath, invoicing_sheet, brand, invoice_rows, deleted_rows
-                )
-                if actual_rows != expected_rows:
-                    raise Exception(
-                        f"登记校验失败：{invoicing_sheet}行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
+            else:
+                if register_entries and progress is not None:
+                    progress('报关开票：写入登记表')
+                for register_df, register_filepath, invoicing_sheet, brand, invoice_rows in register_entries:
+                    register_original_rows = self.find_last_data_row(register_filepath, invoicing_sheet)
+                    deleted_rows = self.check_invoice_number(
+                        register_filepath, self.shipping_details['invoice_number'], invoicing_sheet, '合同号'
                     )
+                    expected_rows = register_original_rows - deleted_rows + len(register_df)
+                    actual_rows = self.write_invoicing_register(
+                        register_df, register_filepath, invoicing_sheet, brand, invoice_rows, deleted_rows
+                    )
+                    if actual_rows != expected_rows:
+                        raise Exception(
+                            f"登记校验失败：{invoicing_sheet}行数不匹配，预计行数:{expected_rows}，实际行数:{actual_rows}"
+                        )
             append_call_record(
                 module_name="发货单",
                 action="登记数据",
@@ -3087,6 +3238,13 @@ class CustomsDeclaration:
                 invoice_number=self.shipping_details.get('invoice_number', ''),
                 source_file=source_file,
             )
+        except WorkbookStagingAborted as exc:
+            message = str(exc)
+            if register_shipping:
+                message += ' 出运明细已登记，请勿整票重跑。'
+            # The shared metrics workbook can block on the same SMB outage; report locally instead.
+            log_message(f"易达开票 {self.shipping_details.get('invoice_number', '')} | 登记未完成：{message}")
+            raise type(exc)(message) from exc
         except Exception as e:
             append_call_record(
                 module_name="发货单",
