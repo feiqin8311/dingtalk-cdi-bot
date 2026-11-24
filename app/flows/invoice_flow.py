@@ -11,6 +11,7 @@ from app.renderers.customs_declaration import render_customs_declaration
 from app.renderers.detailed_list import render_detailed_list
 from app.renderers.elements_sheet import render_elements_sheet
 from app.renderers.packing_list import render_packing_list
+from app.services.ezarc_source_service import write_ezarc_deductions
 
 
 class InvoiceFlow:
@@ -29,6 +30,9 @@ class InvoiceFlow:
                                flag: bool, generate_declaration_file: bool = True) -> None:
         generator = self.generator
         generator.lcl_flag = flag
+        generator.ezarc_maintenance_update = None
+        generator.ezarc_source_rows = None
+        generator.physical_packing_df = None
         start_time = datetime.datetime.now()
         source_file = os.path.basename(invoice_filepath)
 
@@ -99,6 +103,13 @@ class InvoiceFlow:
             export_worksheet_to_pdf(output_filepath, "合同", contract_pdf_path)
             self._log_timed_step(generator, "导出销售合同 PDF", step_started_at)
             generator.log_message(f"销售合同 PDF 输出文件: {contract_pdf_path}")
+            update = generator.ezarc_maintenance_update
+            if update is not None and update.deductions:
+                try:
+                    write_ezarc_deductions(update)
+                except Exception as exc:
+                    raise RuntimeError(f"报关资料已生成，但海联维护表未更新：{exc}") from exc
+                generator.log_message(f"海联维护表已登记 {update.invoice_number}：{len(update.deductions)} 个 SKU")
             generator.log_message("报关资料生成完成(发货单)")
             generator.append_call_record(
                 module_name="发货单",
