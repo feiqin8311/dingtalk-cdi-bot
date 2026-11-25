@@ -1029,6 +1029,16 @@ class CustomsDeclaration:
             ['报关中文品名', 'SKU', '备货数量', '总PCS', '申报总价', '申报总价_未含运费', '箱数', '总重量（kg）-箱子',
              '实际总体积（m³）-箱子', '箱子长度（cm）', '箱子宽度（cm）', '是否含金刚石', '品牌',
              '境内货源地', '境内货源地显示', '供应商名称', '采购员']]
+
+        invalid_box_df = result_df.loc[result_df['箱数'] <= 0, [
+            'SKU', '报关中文品名', '箱数', '总重量（kg）-箱子', '实际总体积（m³）-箱子',
+        ]]
+        if not invalid_box_df.empty:
+            raise ValueError(
+                "拼箱结果存在箱数<=0的数据，无法继续生成报关资料，请检查拼箱分组或箱数回补逻辑：\n"
+                f"{invalid_box_df.to_string(index=False)}"
+            )
+
         result_df['箱子高度（cm）'] = (
                 result_df['实际总体积（m³）-箱子'] * 1000000 / result_df['箱子长度（cm）'] / result_df['箱子宽度（cm）'] /
                 result_df[

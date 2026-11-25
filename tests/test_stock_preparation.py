@@ -261,6 +261,74 @@ class StockBasicInformationTests(unittest.TestCase):
             CustomsDeclaration.resolve_warehouse_recipient(pd.Series(["未知仓库"]))
 
 
+class StockLclBoxCountTests(unittest.TestCase):
+    @staticmethod
+    def _run_lcl(generator, physical_boxes, sku_count):
+        skus = [f"SKU-{i}" for i in range(1, sku_count + 1)]
+        names = [f"测试品名{i}" for i in range(1, sku_count + 1)]
+        packing_df = pd.DataFrame({
+            "备货单号": "STOCK-001",
+            "SKU": skus,
+            "品名": names,
+            "备货数量": 5,
+            "单箱数量": 5,
+            "箱数": physical_boxes,
+            "箱子毛重（kg）": 12.0,
+            "箱子长度（cm）": 50.0,
+            "箱子宽度（cm）": 40.0,
+            "箱子高度（cm）": 20.0,
+            "总重量（kg）-箱子": 12.0 * physical_boxes,
+            "总体积（m³）-箱子": 0.04 * physical_boxes,
+        })
+        details_df = pd.DataFrame({"SKU": skus, "店铺": "测试店铺"})
+        product_df = pd.DataFrame({
+            "*SKU": skus,
+            "报关中文品名": names,
+            "单品毛重(g)": 100,
+            "外箱规格长(cm)": 50,
+            "外箱规格宽(cm)": 40,
+            "外箱规格高(cm)": 20,
+            "单箱数量(pcs)": 5,
+            "材质": "钢",
+            "品牌": "TEST",
+        })
+        price_df = pd.DataFrame({"*SKU": skus, "申报单价": 1.0})
+        names_df = pd.DataFrame({
+            "报关品名": names, "英文品名": "Test item", "HS CODE": "8207901000", "单位": "件",
+        })
+        generator.shipping_details.update(domestic_source_of_goods="测试货源地", freight=0.0)
+
+        with (
+            patch.object(generator, "get_basic_information", return_value=(packing_df, details_df, product_df)),
+            patch.object(generator, "process_declared_unit_price", return_value=price_df),
+            patch.object(generator, "_get_product_name_df", return_value=names_df),
+        ):
+            generator.lcl_situation("stock.xlsx", "product.xlsx", "names.xlsx", "site.xlsx")
+
+    def test_rejects_zero_and_negative_box_counts_after_rebalancing(self):
+        for sku_count, invalid_boxes in [(2, 0), (3, -1)]:
+            with self.subTest(sku_count=sku_count):
+                generator = CustomsDeclaration()
+                with patch.object(generator, "calculate_shipping_costs") as calculate_freight:
+                    with self.assertRaisesRegex(ValueError, r"拼箱结果存在箱数<=0") as error:
+                        self._run_lcl(generator, physical_boxes=1, sku_count=sku_count)
+
+                self.assertRegex(str(error.exception), rf"SKU-1\s+测试品名1\s+{invalid_boxes}\s")
+                calculate_freight.assert_not_called()
+                self.assertIsNone(generator.result_df)
+
+    def test_valid_shared_boxes_preserve_physical_box_count(self):
+        generator = CustomsDeclaration()
+        with patch.object(generator, "calculate_shipping_costs") as calculate_freight:
+            self._run_lcl(generator, physical_boxes=2, sku_count=2)
+
+        self.assertEqual(generator.result_df["箱数"].tolist(), [1, 1])
+        self.assertEqual(generator.shipping_details["TOTAL_PACKED_IN"], 2)
+        self.assertEqual(generator.result_df["每件毛重KGS"].tolist(), [12.0, 12.0])
+        self.assertEqual(generator.result_df["箱子高度（cm）"].tolist(), [21.0, 21.0])
+        calculate_freight.assert_called_once_with(0.08, 24.0)
+
+
 class FindDataGroupOrderTests(unittest.TestCase):
     def setUp(self):
         _ELEMENTS_GROUP_CACHE.clear()
