@@ -235,6 +235,106 @@ def test_register_all_documents_writes_split_quantity_to_both_ezarc_sheets(tmp_p
         book.close()
 
 
+def test_ezarc_split_uses_rounded_unit_price_in_the_detailed_list():
+    generator = CustomsDeclaration()
+    generator.company_info_index = 0
+    generator.shipping_details.update(generator.company_info[0])
+    generator.shipping_details.update(
+        brand='EZARC', invoice_number='26EA307', country_zh='美国', country='USA',
+        transportation_method='海卡', logistics_provider='龙舟', Logistics_center='ONT6',
+        recipient='Amazon', today='Nov.25,2026', mark='FBA',
+    )
+    items = [
+        ('80923003', '切割片', 15, 4.81, .01, 1),
+        ('80923007', '切割片', 32, 6.25, .02, 1),
+        ('80926011', '切割片', 84, 9.61, .13, 7),
+        ('801621', '锯片', 10, 12.05, .01, 2),
+    ]
+    packing = pd.DataFrame([
+        {'SKU': sku, '品名': name, '发货数量': qty, '箱数': boxes, '箱子毛重（kg）': 15,
+         '总重量（kg）-箱子': 15 * boxes, '总体积（m³）-箱子': volume,
+         '箱子长度（cm）': 33, '箱子宽度（cm）': 32}
+        for sku, name, qty, _, volume, boxes in items
+    ])
+    details = pd.DataFrame({'SKU': packing['SKU'], '店铺': 'EZARC'})
+    products = pd.DataFrame({
+        '*SKU': packing['SKU'], '报关中文品名': packing['品名'], '货源地': HANGZHOU_SOURCE,
+        '供应商名称': '内部供应商', '报关用采购成本(CNY)': 10, '材质': '氧化铝',
+    })
+    names = pd.DataFrame({'报关品名': ['切割片', '锯片'], '英文品名': ['Cut Off Wheel', 'Saw Blade'],
+                          'HS CODE': ['6804221000', '8202911000'], '单位': '套'})
+    prices = pd.DataFrame({'*SKU': packing['SKU'], '申报单价': [item[3] for item in items]})
+    allocations = {'801621': SourceAllocation(1, 9, JIAXING, '外部供应商')}
+    with patch.object(generator, 'get_basic_information', return_value=(packing, details, products)), \
+            patch.object(generator, '_get_product_name_df', return_value=names), \
+            patch.object(generator, 'process_declared_unit_price', return_value=prices), \
+            patch('Invoice_Data.shared_calculate_shipping_costs', return_value=(29.52, 'volume')), \
+            patch('Invoice_Data.plan_ezarc_sources', return_value=(allocations, None)):
+        generator.process_invoice('invoice.xlsx', 'products.xlsx', 'names.xlsx', 'sites.xlsx')
+
+    assert generator.ezarc_source_rows is not None
+    group = generator.result_df.set_index(['报关中文品名', '境内货源地'])
+    columns = ['发货数量', '申报单价', '总价']
+    assert group.loc[('切割片', HANGZHOU_SOURCE), columns].tolist() == [131, 8.45, 1106.95]
+    assert group.loc[('锯片', JIAXING), columns].tolist() == [9, 12.22, 109.98]
+    assert generator.shipping_details['TOTAL_PRICE'] == 1229.15
+
+    book = Workbook()
+    try:
+        with patch.object(generator, 'add_images'):
+            generator.add_detailed_list_sheet('unused.xlsx', 'pictures', wb=book)
+        sheet = book['明细单']
+        assert [sheet[cell].value for cell in ('A15', 'E15', 'I15', 'J15')] == ['80926011', 131, 8.45, 1106.95]
+    finally:
+        book.close()
+
+
+def test_ezarc_packing_list_splits_by_source_without_double_counting_cartons():
+    generator = CustomsDeclaration()
+    generator.company_info_index = 0
+    generator.shipping_details.update(generator.company_info[0])
+    generator.shipping_details.update(
+        brand='EZARC', invoice_number='26EA1', recipient='Amazon', today='Nov.25,2026', mark='FBA',
+    )
+    packing = pd.DataFrame([
+        {'SKU': sku, '品名': '往复锯条', '发货数量': qty, '箱数': 1, '箱子毛重（kg）': weight,
+         '总重量（kg）-箱子': weight, '总体积（m³）-箱子': volume,
+         '箱子长度（cm）': 40, '箱子宽度（cm）': 25}
+        for sku, qty, weight, volume in [('MIXED', 100, 10, .05), ('EXTERNAL', 30, 5, .02)]
+    ])
+    details = pd.DataFrame({'SKU': packing['SKU'], '店铺': 'EZARC'})
+    products = pd.DataFrame({
+        '*SKU': packing['SKU'], '报关中文品名': '往复锯条', '货源地': HANGZHOU_SOURCE,
+        '供应商名称': '原供应商', '报关用采购成本(CNY)': 10, '材质': '钢',
+    })
+    names = pd.DataFrame([{'报关品名': '往复锯条', '英文品名': 'Reciprocating Saw Blade',
+                           'HS CODE': '8202911000', '单位': '套'}])
+    prices = pd.DataFrame({'*SKU': packing['SKU'], '申报单价': 2})
+    allocations = {
+        'MIXED': SourceAllocation(80, 20, NANJING, '南京供应商'),
+        'EXTERNAL': SourceAllocation(0, 30, JIAXING, '嘉兴供应商'),
+    }
+    with patch.object(generator, 'get_basic_information', return_value=(packing, details, products)), \
+            patch.object(generator, '_get_product_name_df', return_value=names), \
+            patch.object(generator, 'process_declared_unit_price', return_value=prices), \
+            patch.object(generator, 'calculate_shipping_costs'), \
+            patch('Invoice_Data.plan_ezarc_sources', return_value=(allocations, None)):
+        generator.shipping_details['freight'] = 0
+        generator.process_invoice('invoice.xlsx', 'products.xlsx', 'names.xlsx', 'sites.xlsx')
+
+    book = Workbook()
+    try:
+        with patch.object(generator, 'add_images'):
+            generator.add_packing_list_sheet('unused.xlsx', 'pictures', wb=book)
+        rows = list(book['装箱单'].values)
+        items = [(row[1], row[3], row[5], row[7]) for row in rows if row[2] == 'Reciprocating Saw Blade']
+        assert items == [('MIXED', 20, 0, 2), ('MIXED', 80, 1, 8), ('EXTERNAL', 30, 1, 5)]
+        footer = {row[2]: row[3] for row in rows if row[2] in {'TOTAL QUANTITY:', 'TOTAL PACKED IN:'}}
+        assert footer == {'TOTAL QUANTITY:': 130, 'TOTAL PACKED IN:': 2}
+    finally:
+        book.close()
+
+
 def test_external_register_uses_the_same_lines_and_amounts_as_the_declaration():
     g = CustomsDeclaration()
     g.company_info_index = 0
@@ -278,7 +378,7 @@ def test_external_register_uses_the_same_lines_and_amounts_as_the_declaration():
     assert list(external[['HS编码', '数量', '单位', '单价', '总价']].itertuples(index=False, name=None)) == external_lines
     by_sku = external.set_index('SKU')
     merged = by_sku.loc['801401、801612、801905N']
-    assert (merged['数量'], merged['单价'], merged['总价']) == (174, 9.81, 1707.31)
+    assert (merged['数量'], merged['单价'], merged['总价']) == (174, 9.81, 1706.94)
     assert (merged['供应商名称'], merged['采购员']) == ('供应商甲、供应商乙', '采购甲')
     assert set(by_sku.index) == {'801401、801612、801905N', '802062', 'D1'}
     assert list(entries['2026（内部开票）']['SKU']) == ['HZ']

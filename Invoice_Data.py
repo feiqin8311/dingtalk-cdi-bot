@@ -193,7 +193,7 @@ class CustomsDeclaration:
         self.ezarc_maintenance_path = maintenance_path if maintenance_path is not None else ezarc_maintenance_path()
         self.ezarc_maintenance_update = None
         self.ezarc_source_rows = None
-        self.physical_packing_df = None
+        self.packing_list_df = None
         self._excel_cache = ExcelCache()
         self._product_name_cache = {}
         self._declared_price_cache = {}
@@ -1128,7 +1128,7 @@ class CustomsDeclaration:
         self.lcl_flag = False
         self.ezarc_maintenance_update = None
         self.ezarc_source_rows = None
-        self.physical_packing_df = None
+        self.packing_list_df = None
         use_maintenance = self.shipping_details.get('brand') == 'EZARC'
         if use_maintenance:
             invoice_df['SKU'] = invoice_df['SKU'].map(sku_key)
@@ -1225,6 +1225,7 @@ class CustomsDeclaration:
         # 新增是否含金刚石列
         merge_df['是否含金刚石'] = merge_df['材质'].str.contains('金刚石', na=False)
 
+        physical = None
         if use_maintenance:
             if merge_df['SKU'].duplicated().any():
                 raise ValueError('产品或申报单价资料存在重复 SKU，无法按 SKU 分摊报关数量')
@@ -1233,12 +1234,16 @@ class CustomsDeclaration:
                 merge_df.set_index('SKU')['发货数量'].to_dict(),
             )
             if any(item.external for item in allocations.values()):
-                self.physical_packing_df = self._summarize_non_lcl(merge_df, product_df)
+                physical = self._summarize_non_lcl(merge_df, product_df)
                 self.ezarc_source_rows = split_ezarc_rows(merge_df, allocations)
                 merge_df = self.ezarc_source_rows
 
         result_df = self._summarize_non_lcl(merge_df, product_df)
-        physical = self.physical_packing_df if self.physical_packing_df is not None else result_df
+        if physical is None:
+            physical = result_df
+        else:
+            # 装箱单按货源地分行，且不受后面按 SKU 关联店铺的影响；整票合计仍取实箱汇总。
+            self.packing_list_df = result_df
         self.shipping_details['TOTAL_QUANTITY'] = result_df['发货数量'].sum()
         self.shipping_details['TOTAL_PACKED_IN'] = physical['箱数'].sum()
         self.shipping_details['TOTAL_G.W'] = physical['箱子总毛重（kg）'].sum().round(2)
@@ -1275,8 +1280,9 @@ class CustomsDeclaration:
         temp_df = sum_df.merge(top_sku_sr, on=declaration_group_cols)
         result_df = temp_df.merge(top_length_sr, on=declaration_group_cols)
 
-        # 申报单价,保留两位小数
+        # 含运费申报单价先保留两位，再乘数量计算总价；拆分货源地时也一样。
         result_df['申报单价'] = (result_df['申报总价'] / result_df['发货数量']).round(2)
+        result_df['总价'] = (result_df['发货数量'] * result_df['申报单价']).round(2)
 
         # 单箱重量
         result_df['单箱重量'] = (result_df['总重量（kg）-箱子'] / result_df['箱数'])
@@ -1289,9 +1295,6 @@ class CustomsDeclaration:
 
         # 包装种类
         result_df['包装种类'] = '纸箱'
-        # Retain the apportioned amount instead of multiplying a rounded unit price back out.
-        total = result_df['申报总价'] if split_sources else result_df['发货数量'] * result_df['申报单价']
-        result_df['总价'] = total.round(2)
         # 每件毛重KGS
         result_df['每件毛重KGS'] = (result_df['箱子总毛重（kg）'] / result_df['箱数'])
         # 每件净重KGS
@@ -1569,7 +1572,7 @@ class CustomsDeclaration:
         ]
 
         # 插入的数据
-        packing_df = self.physical_packing_df if self.physical_packing_df is not None else self.result_df
+        packing_df = self.packing_list_df if self.packing_list_df is not None else self.result_df
         result_data = packing_df.values.tolist()
         insert_data = []
         for temp_data in result_data:
@@ -2593,17 +2596,9 @@ class CustomsDeclaration:
             invoice_filepath,
             sheet_name=self.invoice_detail_sheet_name,
         )
-        warehouse_column = next(
-            (
-                column for column in ('发货仓库（单据明细）', '发货仓库（单据）')
-                if column in invoice_details_df.columns
-            ),
-            None,
-        )
-        if warehouse_column is None:
-            raise ValueError(
-                "登记出运明细失败：发货单详情缺少“发货仓库（单据明细）”或“发货仓库（单据）”列"
-            )
+        warehouse_column = '发货仓库（单据）'
+        if warehouse_column not in invoice_details_df.columns:
+            raise ValueError(f"登记出运明细失败：发货单详情缺少“{warehouse_column}”列")
 
         invoice_details_df['SKU'] = invoice_details_df['SKU'].astype(str)
         invoice_details_df['店铺'] = invoice_details_df['店铺'].str.split('[ -]').str[0].str.upper()
@@ -2611,13 +2606,10 @@ class CustomsDeclaration:
         invoice_details_df = invoice_details_df[
             ['SKU', '运输方式', '物流商单号', '店铺', '物流中心编码', '发货单号', warehouse_column, '物流商']]
         invoice_details_df = invoice_details_df.ffill()
-        # 优先使用发货仓库（单据明细）；旧发货单没有该列时回退到发货仓库（单据）。
         warehouse_source = invoice_details_df[warehouse_column].fillna("").astype(str).str.strip()
-        invoice_details_df['发货仓库（单据）'] = np.where(
+        invoice_details_df[warehouse_column] = np.where(
             warehouse_source.eq("杭州虚拟仓"), "工厂直发", "仓库发货"
         )
-        if warehouse_column != '发货仓库（单据）':
-            invoice_details_df.drop(columns=[warehouse_column], inplace=True)
 
         # 装箱信息可为同一SKU拆出多行；详情信息只提供每个SKU的公共物流属性。
         detail_keys = ['SKU', '发货单号']

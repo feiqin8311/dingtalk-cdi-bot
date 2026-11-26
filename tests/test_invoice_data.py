@@ -278,7 +278,7 @@ class InvoiceRegisterTargetSelectionTests(unittest.TestCase):
 
         self.assertEqual(result["发货仓库（单据）"].tolist(), ["工厂直发", "仓库发货"])
 
-    def test_register_combined_invoice_prefers_detail_warehouse_column(self):
+    def test_register_combined_invoice_uses_document_warehouse_column_only(self):
         generator = CustomsDeclaration()
         invoice_df = pd.DataFrame([
             {
@@ -314,7 +314,12 @@ class InvoiceRegisterTargetSelectionTests(unittest.TestCase):
         with patch.object(generator, "_read_excel_cached", side_effect=[invoice_df, invoice_details_df]):
             result = generator.register_combined_invoice("invoice.xlsx")
 
-        self.assertEqual(result.loc[0, "发货仓库（单据）"], "工厂直发")
+        self.assertEqual(result.loc[0, "发货仓库（单据）"], "仓库发货")
+
+        details_without_document_warehouse = invoice_details_df.drop(columns=["发货仓库（单据）"])
+        with patch.object(generator, "_read_excel_cached", side_effect=[invoice_df, details_without_document_warehouse]):
+            with self.assertRaisesRegex(ValueError, "发货单详情缺少“发货仓库（单据）”列"):
+                generator.register_combined_invoice("missing-warehouse.xlsx")
 
     def test_build_invoicing_register_df_for_sutong_deduplicates_sku_rows(self):
         generator = CustomsDeclaration()
