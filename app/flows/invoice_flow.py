@@ -32,7 +32,7 @@ class InvoiceFlow:
         generator.lcl_flag = flag
         generator.ezarc_maintenance_update = None
         generator.ezarc_source_rows = None
-        generator.physical_packing_df = None
+        generator.packing_list_df = None
         start_time = datetime.datetime.now()
         source_file = os.path.basename(invoice_filepath)
 
